@@ -25,7 +25,7 @@ function createWindow() {
         vibrancy: 'under-window', // Mac-native blur effect
         visualEffectState: 'active',
         webPreferences: {
-            preload: path.join(__dirname, 'preload.cjs'),
+            preload: path.join(process.env.APP_ROOT, 'electron', 'preload.cjs'),
             sandbox: false, // Required for deep filesystem access later
             contextIsolation: true
         },
@@ -38,7 +38,6 @@ function createWindow() {
 
     if (VITE_DEV_SERVER_URL) {
         win.loadURL(VITE_DEV_SERVER_URL)
-        win.webContents.openDevTools()
     } else {
         // win.loadFile('dist/index.html')
         win.loadFile(path.join(RENDERER_DIST, 'index.html'))

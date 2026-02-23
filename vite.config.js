@@ -19,23 +19,11 @@ export default defineConfig({
                         }
                     }
                 }
-            },
-            {
-                entry: 'electron/preload.js',
-                onstart(options) {
-                    options.reload()
-                },
-                vite: {
-                    build: {
-                        rollupOptions: {
-                            output: {
-                                entryFileNames: '[name].cjs',
-                                format: 'cjs', // VERY IMPORTANT: Preload MUST be CommonJS
-                            }
-                        }
-                    }
-                }
             }
+            // NOTE: preload.cjs is NOT compiled by Vite. 
+            // It is a raw CommonJS file loaded directly by Electron.
+            // Vite's Rollup bundler was injecting ESM 'export default' syntax 
+            // into the compiled .cjs output, which Electron's preload loader rejects.
         ]),
         renderer(),
     ],

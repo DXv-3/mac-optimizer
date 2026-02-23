@@ -54,12 +54,12 @@ def extract_metadata(app_path):
 def format_date(date_string):
     """Parses Apple metadata dates into human relative strings."""
     if not date_string:
-        return "Never Used", float('inf')
+        return "Never Used", 99999
         
     try:
         # Expected format: 2024-02-15 18:22:33 +0000
         dt_obj = datetime.datetime.strptime(date_string[:19], '%Y-%m-%d %H:%M:%S')
-        now = datetime.datetime.utcnow()
+        now = datetime.datetime.now(datetime.UTC).replace(tzinfo=None)
         delta = now - dt_obj
         
         days_ago = delta.days
@@ -76,7 +76,7 @@ def format_date(date_string):
             years = days_ago // 365
             return f"{years} year{'s' if years > 1 else ''} ago", days_ago
     except Exception:
-        return "Unknown", float('inf')
+        return "Unknown", 99999
 
 def format_size(size_bytes):
     if size_bytes == 0: return "0 B"
