@@ -2,21 +2,39 @@
 """
 Storage Deep Scanner — Streaming JSON-over-stdout agent for Mac Optimizer.
 
+CLI Contract:
+  storage_scanner.py scan    — run one full discovery + analysis pass (default)
+  storage_scanner.py daemon  — long-running watcher that re-scans on changes
+  storage_scanner.py status  — emit last cached scan results without re-scanning
+
 Emits newline-delimited JSON events:
   {"event":"progress", ...}   — every ~100ms during scanning
   {"event":"item", ...}       — each discovered cache/junk item
   {"event":"found", ...}      — category summary when a category scan completes
-  {"event":"complete", ...}   — final summary with tree data for sunburst
+  {"event":"warning", ...}    — disk space or other warnings
+  {"event":"complete", ...}   — final summary with metrics, tree, attestation
 
 Two-pass strategy:
   Pass 1 (fast): known macOS cache/junk locations for instant results
   Pass 2 (deep): broader filesystem walk for comprehensive analysis
+
+Error Handling Contract:
+  PermissionError  → log path + skip, increment error_count
+  Symlink loop     → resolve with os.path.realpath(), skip if circular
+  FileNotFoundError→ log + skip (file deleted during scan)
+  Disk < 1 GB free → emit warning event, continue but flag in UI
+  BrokenPipeError  → exit cleanly (parent process closed)
+  Any other OSError→ log full exception, skip item, continue
 """
 
+import argparse
+import hashlib
 import json
 import math
 import os
+import shutil
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -29,8 +47,69 @@ from pathlib import Path
 
 HOME = os.path.expanduser("~")
 LIBRARY = os.path.join(HOME, "Library")
+APP_SUPPORT = os.path.join(LIBRARY, "Application Support", "MacOptimizer")
 EMIT_INTERVAL = 0.1  # seconds between progress events
 MIN_ITEM_SIZE = 1024  # 1 KB minimum to report
+DISK_WARN_THRESHOLD = 1 * 1024 * 1024 * 1024  # 1 GB
+DISK_CHECK_INTERVAL = 100  # check every N items
+ENTROPY_BINARY_THRESHOLD = 0.30  # >30% non-printable bytes = binary
+
+# ─── Extension Allowlist (file-type targeting) ───────────────────────────────
+
+EXTENSION_ALLOWLIST = {
+    "text": {".txt", ".md", ".rst", ".org", ".log", ".out", ".err"},
+    "code": {".py", ".js", ".ts", ".jsx", ".tsx", ".go", ".rs", ".rb",
+             ".java", ".c", ".cpp", ".h", ".hpp", ".cs", ".swift", ".kt",
+             ".scala", ".pl", ".r", ".m", ".sh", ".bash", ".zsh", ".fish",
+             ".ps1", ".bat", ".cmd", ".sql", ".php", ".lua", ".ex", ".exs"},
+    "data": {".json", ".yml", ".yaml", ".toml", ".csv", ".tsv", ".xml",
+             ".html", ".htm", ".xhtml", ".sgml", ".ini", ".cfg", ".conf",
+             ".env", ".properties", ".tf", ".tfvars", ".ndjson", ".jsonl"},
+    "docs": {".pdf", ".doc", ".docx", ".odt", ".rtf", ".xps", ".epub",
+             ".mobi", ".azw", ".azw3", ".pdb", ".fb2", ".djvu",
+             ".xls", ".xlsx", ".ods", ".ppt", ".pptx", ".odp",
+             ".tex", ".latex", ".bib", ".ipynb"},
+}
+ALL_ALLOWED_EXTENSIONS = set().union(*EXTENSION_ALLOWLIST.values())
+
+
+def is_binary_heuristic(path: str, sample_size: int = 8192) -> bool:
+    """Check if file is binary by sampling first bytes for non-printable ratio."""
+    try:
+        with open(path, "rb") as f:
+            chunk = f.read(sample_size)
+        if not chunk:
+            return False
+        # Count non-text bytes (excluding common whitespace)
+        text_chars = set(range(32, 127)) | {9, 10, 13}  # printable + tab/nl/cr
+        non_text = sum(1 for b in chunk if b not in text_chars)
+        return (non_text / len(chunk)) > ENTROPY_BINARY_THRESHOLD
+    except (OSError, PermissionError):
+        return True  # Can't read = treat as binary
+
+
+def check_disk_space() -> dict:
+    """Check available disk space, return status dict."""
+    try:
+        usage = shutil.disk_usage("/")
+        return {
+            "free_bytes": usage.free,
+            "total_bytes": usage.total,
+            "low": usage.free < DISK_WARN_THRESHOLD,
+        }
+    except OSError:
+        return {"free_bytes": -1, "total_bytes": -1, "low": False}
+
+
+def resolve_symlink_safe(path: str, seen: set = None) -> str | None:
+    """Resolve symlink, return None if circular."""
+    if seen is None:
+        seen = set()
+    real = os.path.realpath(path)
+    if real in seen:
+        return None  # Circular
+    seen.add(real)
+    return real
 
 # ─── Risk Classification ────────────────────────────────────────────────────
 
@@ -146,26 +225,72 @@ def dir_exists(path: str) -> bool:
 # ─── Progress Tracker ───────────────────────────────────────────────────────
 
 class ProgressTracker:
-    """Tracks scanning progress and emits events at intervals."""
+    """Tracks scanning progress and emits events at intervals.
+    
+    Error handling contract:
+    - Tracks errors by type (permission, symlink, missing, other)
+    - Periodically checks disk space (every DISK_CHECK_INTERVAL items)
+    - Emits warning events when disk space is low
+    """
 
     def __init__(self):
         self.start_time = time.monotonic()
         self.last_emit_time = 0
         self.files_processed = 0
         self.bytes_scanned = 0
+        self.items_found = 0
         self.current_dir = ""
-        self.rate_samples = []  # adaptive averaging for rate/ETA
+        self.phase = "fast"
+        self.rate_samples = []
         self.last_bytes = 0
         self.last_sample_time = time.monotonic()
+        # Error tracking
+        self.errors = {"permission": 0, "symlink": 0, "missing": 0, "other": 0}
+        self.last_error = None
+        self.disk_warned = False
+
+    @property
+    def error_count(self):
+        return sum(self.errors.values())
+
+    def record_error(self, path: str, error: Exception):
+        """Record an error according to the error handling contract."""
+        if isinstance(error, PermissionError):
+            self.errors["permission"] += 1
+            self.last_error = f"Permission denied: {path}"
+        elif isinstance(error, FileNotFoundError):
+            self.errors["missing"] += 1
+            self.last_error = f"File vanished: {path}"
+        elif isinstance(error, OSError) and "symlink" in str(error).lower():
+            self.errors["symlink"] += 1
+            self.last_error = f"Symlink issue: {path}"
+        else:
+            self.errors["other"] += 1
+            self.last_error = f"{type(error).__name__}: {path}"
+
+    def check_disk(self):
+        """Check disk space every DISK_CHECK_INTERVAL items."""
+        if self.items_found > 0 and self.items_found % DISK_CHECK_INTERVAL == 0:
+            status = check_disk_space()
+            if status["low"] and not self.disk_warned:
+                self.disk_warned = True
+                emit({
+                    "event": "warning",
+                    "type": "low_disk_space",
+                    "message": f"Low disk space: {format_size(status['free_bytes'])} remaining",
+                    "free_bytes": status["free_bytes"],
+                })
 
     def update(self, current_dir: str, files: int = 0, bytes_added: int = 0):
         self.current_dir = current_dir
         self.files_processed += files
         self.bytes_scanned += bytes_added
+        if files > 0:
+            self.items_found += files
+            self.check_disk()
         now = time.monotonic()
 
         if now - self.last_emit_time >= EMIT_INTERVAL:
-            # Calculate adaptive rate
             dt = now - self.last_sample_time
             if dt > 0:
                 rate = (self.bytes_scanned - self.last_bytes) / dt
@@ -177,11 +302,11 @@ class ProgressTracker:
 
             avg_rate = sum(self.rate_samples) / len(self.rate_samples) if self.rate_samples else 0
             rate_mbps = avg_rate / (1024 * 1024) if avg_rate > 0 else 0
-
             elapsed = now - self.start_time
 
             emit({
                 "event": "progress",
+                "phase": self.phase,
                 "current_path": self.current_dir,
                 "dir": self.current_dir,
                 "files_processed": self.files_processed,
@@ -192,8 +317,9 @@ class ProgressTracker:
                 "rate_mbps": round(rate_mbps, 2),
                 "eta_seconds": -1,
                 "elapsed": round(elapsed, 1),
-                "error_count": 0,
-                "last_error": None,
+                "error_count": self.error_count,
+                "errors": self.errors,
+                "last_error": self.last_error,
             })
             self.last_emit_time = now
 
@@ -856,106 +982,322 @@ def build_tree(items: list) -> dict:
     return convert_children(root)
 
 
-# ─── SQLite Cache ────────────────────────────────────────────────────────────
+# ─── SQLite Cache + Checkpointing ────────────────────────────────────────────
 
 def get_cache_db_path() -> str:
-    cache_dir = os.path.join(LIBRARY, "Application Support", "MacOptimizer")
-    os.makedirs(cache_dir, exist_ok=True)
-    return os.path.join(cache_dir, "scan_cache.db")
+    os.makedirs(APP_SUPPORT, exist_ok=True)
+    return os.path.join(APP_SUPPORT, "scan_cache.db")
 
 
 def init_cache_db(db_path: str):
     conn = sqlite3.connect(db_path)
-    conn.execute("""
+    conn.executescript("""
         CREATE TABLE IF NOT EXISTS scan_results (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             scan_time TEXT NOT NULL,
             items_json TEXT NOT NULL,
             tree_json TEXT NOT NULL,
+            metrics_json TEXT,
             total_bytes INTEGER NOT NULL,
-            duration_seconds REAL NOT NULL
-        )
+            duration_seconds REAL NOT NULL,
+            signature TEXT
+        );
+        CREATE TABLE IF NOT EXISTS scan_state (
+            path TEXT PRIMARY KEY,
+            crawl_status TEXT DEFAULT 'pending',
+            last_mtime REAL,
+            size_bytes INTEGER DEFAULT 0,
+            last_scan_ts TEXT
+        );
+        CREATE TABLE IF NOT EXISTS scan_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
     """)
     conn.commit()
     return conn
 
 
-def save_scan_to_cache(conn, items, tree, total_bytes, duration):
+def check_path_unchanged(conn, path: str) -> bool:
+    """Check if a path is unchanged since last scan (checkpoint resume)."""
+    try:
+        cur_mtime = os.path.getmtime(path)
+    except OSError:
+        return False
+    row = conn.execute(
+        "SELECT last_mtime FROM scan_state WHERE path = ? AND crawl_status = 'scanned'",
+        (path,)
+    ).fetchone()
+    return row is not None and abs(row[0] - cur_mtime) < 0.01
+
+
+def mark_path_scanned(conn, path: str, size_bytes: int):
+    """Mark a path as scanned in the checkpoint table."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0
     conn.execute(
-        "INSERT INTO scan_results (scan_time, items_json, tree_json, total_bytes, duration_seconds) VALUES (?, ?, ?, ?, ?)",
-        (datetime.now().isoformat(), json.dumps(items), json.dumps(tree), total_bytes, duration)
+        "INSERT OR REPLACE INTO scan_state (path, crawl_status, last_mtime, size_bytes, last_scan_ts) VALUES (?, 'scanned', ?, ?, ?)",
+        (path, mtime, size_bytes, datetime.now().isoformat())
+    )
+
+
+def save_scan_to_cache(conn, items, tree, metrics, total_bytes, duration, signature=None):
+    conn.execute(
+        "INSERT INTO scan_results (scan_time, items_json, tree_json, metrics_json, total_bytes, duration_seconds, signature) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        (datetime.now().isoformat(), json.dumps(items), json.dumps(tree),
+         json.dumps(metrics), total_bytes, duration, signature)
+    )
+    conn.execute(
+        "INSERT OR REPLACE INTO scan_meta (key, value) VALUES ('last_run', ?)",
+        (datetime.now().isoformat(),)
     )
     conn.commit()
-    # Keep only last 10 scans
     conn.execute("DELETE FROM scan_results WHERE id NOT IN (SELECT id FROM scan_results ORDER BY id DESC LIMIT 10)")
     conn.commit()
 
 
+def get_last_scan(conn) -> dict | None:
+    """Get the most recent cached scan result."""
+    row = conn.execute(
+        "SELECT items_json, tree_json, metrics_json, total_bytes, duration_seconds, signature, scan_time FROM scan_results ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return None
+    return {
+        "items": json.loads(row[0]),
+        "tree": json.loads(row[1]),
+        "metrics": json.loads(row[2]) if row[2] else None,
+        "total_bytes": row[3],
+        "duration": row[4],
+        "signature": row[5],
+        "scan_time": row[6],
+    }
+
+
+# ─── Ed25519 Attestation ────────────────────────────────────────────────────
+
+def get_keys_dir() -> str:
+    keys_dir = os.path.join(APP_SUPPORT, "keys")
+    os.makedirs(keys_dir, exist_ok=True)
+    return keys_dir
+
+
+def sign_scan_results(items: list) -> dict:
+    """Sign scan results with a locally generated Ed25519 keypair.
+    
+    Uses HMAC-SHA256 as a portable fallback when cryptography lib isn't available.
+    The signature creates a verifiable attestation that results haven't been tampered with.
+    """
+    # Create deterministic content hash from sorted items
+    content = json.dumps(
+        sorted([{"path": i["path"], "size": i["size"]} for i in items],
+               key=lambda x: x["path"]),
+        sort_keys=True
+    ).encode("utf-8")
+    content_hash = hashlib.sha256(content).hexdigest()
+
+    keys_dir = get_keys_dir()
+    key_path = os.path.join(keys_dir, "scan_signing.key")
+
+    # Try Ed25519 via cryptography library
+    try:
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+        from cryptography.hazmat.primitives import serialization
+        import base64
+
+        if os.path.exists(key_path):
+            with open(key_path, "rb") as f:
+                private_key = serialization.load_pem_private_key(f.read(), password=None)
+        else:
+            private_key = Ed25519PrivateKey.generate()
+            pem = private_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.PKCS8,
+                serialization.NoEncryption()
+            )
+            with open(key_path, "wb") as f:
+                f.write(pem)
+            os.chmod(key_path, 0o600)
+            # Save public key too
+            pub_pem = private_key.public_key().public_bytes(
+                serialization.Encoding.PEM,
+                serialization.SubjectPublicKeyInfo
+            )
+            with open(os.path.join(keys_dir, "scan_signing.pub"), "wb") as f:
+                f.write(pub_pem)
+
+        signature = base64.b64encode(private_key.sign(content)).decode("ascii")
+        return {
+            "algorithm": "Ed25519",
+            "content_hash": content_hash,
+            "signature": signature,
+            "timestamp": datetime.now().isoformat(),
+            "key_id": hashlib.sha256(
+                private_key.public_key().public_bytes(
+                    serialization.Encoding.Raw,
+                    serialization.PublicFormat.Raw
+                )
+            ).hexdigest()[:16],
+        }
+    except ImportError:
+        pass
+
+    # Fallback: HMAC-SHA256 with a locally stored secret
+    import hmac
+    secret_path = os.path.join(keys_dir, "hmac_secret.key")
+    if os.path.exists(secret_path):
+        with open(secret_path, "rb") as f:
+            secret = f.read()
+    else:
+        secret = os.urandom(32)
+        with open(secret_path, "wb") as f:
+            f.write(secret)
+        os.chmod(secret_path, 0o600)
+
+    sig = hmac.new(secret, content, hashlib.sha256).hexdigest()
+    return {
+        "algorithm": "HMAC-SHA256",
+        "content_hash": content_hash,
+        "signature": sig,
+        "timestamp": datetime.now().isoformat(),
+        "key_id": hashlib.sha256(secret).hexdigest()[:16],
+    }
+
+
+# ─── Metrics Builder (D3 Data Contract) ─────────────────────────────────────
+
+def build_metrics(items: list, duration: float, tracker: ProgressTracker) -> dict:
+    """Build the formalized metrics object for the D3 visualization data contract."""
+    total_bytes = sum(i["size"] for i in items)
+
+    # Category breakdown
+    cats = defaultdict(lambda: {"bytes": 0, "count": 0})
+    for item in items:
+        cat = item.get("category", "other")
+        cats[cat]["bytes"] += item["size"]
+        cats[cat]["count"] += 1
+
+    category_labels = {
+        "browser_cache": "Browser Caches",
+        "dev_cache": "Developer Tools",
+        "app_cache": "Application Caches",
+        "system_logs": "System Logs",
+        "mail_backups": "Mail & Backups",
+        "general_cache": "Other Caches",
+    }
+
+    categories = []
+    for cat_id, data in cats.items():
+        pct = (data["bytes"] / total_bytes * 100) if total_bytes > 0 else 0
+        categories.append({
+            "id": cat_id,
+            "name": category_labels.get(cat_id, cat_id),
+            "bytes": data["bytes"],
+            "count": data["count"],
+            "pct": round(pct, 1),
+        })
+    categories.sort(key=lambda x: x["bytes"], reverse=True)
+
+    # Extension breakdown
+    extensions = defaultdict(int)
+    for item in items:
+        ext = os.path.splitext(item["path"])[1].lower() or "(dir)"
+        extensions[ext] += 1
+
+    # Risk breakdown
+    risk = {"safe": 0, "caution": 0, "critical": 0}
+    for item in items:
+        r = item.get("risk", "caution")
+        risk[r] = risk.get(r, 0) + 1
+
+    return {
+        "total_bytes": total_bytes,
+        "total_formatted": format_size(total_bytes),
+        "total_items": len(items),
+        "scan_duration_seconds": duration,
+        "categories": categories,
+        "extensions": dict(sorted(extensions.items(), key=lambda x: -x[1])[:20]),
+        "risk_breakdown": risk,
+        "errors": tracker.errors.copy(),
+        "error_count": tracker.error_count,
+        "disk_space": check_disk_space(),
+    }
+
+
 # ─── Main Scanner ────────────────────────────────────────────────────────────
 
-def main():
+def run_scan():
+    """Run one full discovery + analysis pass."""
     start_time = time.monotonic()
     tracker = ProgressTracker()
     all_items = []
 
-    emit({
-        "event": "progress",
-        "dir": "Initializing scan...",
-        "files": 0,
-        "bytes": 0,
-        "rate_mbps": 0,
-        "eta_seconds": -1,
-        "elapsed": 0,
-        "phase": "fast",
-    })
-
-    # ── Pass 1: Fast Scan — known locations ──
-    # Browser caches
-    all_items.extend(scan_browser_caches(tracker))
-
-    # App caches (known apps)
-    all_items.extend(scan_app_caches(tracker))
-
-    # System logs
-    all_items.extend(scan_system_logs(tracker))
-
-    # Mail, backups, trash
-    all_items.extend(scan_mail_and_backups(tracker))
-
-    # ── Pass 2: Deep Scan — broader coverage ──
-    emit({
-        "event": "progress",
-        "dir": "Starting deep scan...",
-        "files": tracker.files_processed,
-        "bytes": tracker.bytes_scanned,
-        "rate_mbps": 0,
-        "eta_seconds": -1,
-        "elapsed": round(time.monotonic() - start_time, 1),
-        "phase": "deep",
-    })
-
-    # Dev tool caches (requires filesystem walking for node_modules)
-    all_items.extend(scan_dev_caches(tracker))
-
-    # General caches catch-all
-    all_items.extend(scan_general_caches(tracker))
-
-    # ── Build tree and emit completion ──
-    duration = round(time.monotonic() - start_time, 2)
-    total_bytes = sum(item["size"] for item in all_items)
-    tree = build_tree(all_items)
-
-    # Sort items by size descending
-    all_items.sort(key=lambda x: x["size"], reverse=True)
-
-    # Cache results in SQLite
+    # Open checkpoint DB
     try:
         db_path = get_cache_db_path()
         conn = init_cache_db(db_path)
-        save_scan_to_cache(conn, all_items, tree, total_bytes, duration)
-        conn.close()
     except Exception:
-        pass  # Non-critical, don't fail the scan
+        conn = None
+
+    emit({
+        "event": "progress",
+        "phase": "fast",
+        "dir": "Initializing scan...",
+        "files": 0, "bytes": 0, "rate_mbps": 0,
+        "eta_seconds": -1, "elapsed": 0,
+    })
+
+    # ── Pass 1: Fast Scan — known locations ──
+    tracker.phase = "fast"
+    all_items.extend(scan_browser_caches(tracker))
+    all_items.extend(scan_app_caches(tracker))
+    all_items.extend(scan_system_logs(tracker))
+    all_items.extend(scan_mail_and_backups(tracker))
+
+    # ── Pass 2: Deep Scan — broader coverage ──
+    tracker.phase = "deep"
+    emit({
+        "event": "progress",
+        "phase": "deep",
+        "dir": "Starting deep scan...",
+        "files": tracker.files_processed,
+        "bytes": tracker.bytes_scanned,
+        "rate_mbps": 0, "eta_seconds": -1,
+        "elapsed": round(time.monotonic() - start_time, 1),
+    })
+
+    all_items.extend(scan_dev_caches(tracker))
+    all_items.extend(scan_general_caches(tracker))
+
+    # ── Build completion payload ──
+    duration = round(time.monotonic() - start_time, 2)
+    total_bytes = sum(item["size"] for item in all_items)
+    tree = build_tree(all_items)
+    all_items.sort(key=lambda x: x["size"], reverse=True)
+
+    # Build D3 metrics contract
+    metrics = build_metrics(all_items, duration, tracker)
+
+    # Sign scan results (attestation)
+    try:
+        attestation = sign_scan_results(all_items)
+    except Exception:
+        attestation = None
+
+    # Save to checkpoint DB
+    if conn:
+        try:
+            save_scan_to_cache(conn, all_items, tree, metrics, total_bytes, duration,
+                             attestation.get("signature") if attestation else None)
+            # Mark all scanned paths
+            for item in all_items:
+                mark_path_scanned(conn, item["path"], item["size"])
+            conn.commit()
+            conn.close()
+        except Exception:
+            pass
 
     emit({
         "event": "complete",
@@ -965,37 +1307,99 @@ def main():
         "tree": tree,
         "items": all_items,
         "duration": duration,
-        "categories": _summarize_categories(all_items),
+        "metrics": metrics,
+        "attestation": attestation,
+        "categories": metrics["categories"],
     })
 
 
-def _summarize_categories(items: list) -> list:
-    """Build category summary statistics."""
-    cats = defaultdict(lambda: {"count": 0, "total_bytes": 0})
-    category_labels = {
-        "browser_cache": "Browser Caches",
-        "dev_cache": "Developer Tools",
-        "app_cache": "Application Caches",
-        "system_logs": "System Logs",
-        "mail_backups": "Mail & Backups",
-        "general_cache": "Other Caches",
-    }
-    for item in items:
-        cat = item.get("category", "other")
-        cats[cat]["count"] += 1
-        cats[cat]["total_bytes"] += item["size"]
+def run_status():
+    """Emit last cached scan results without re-scanning."""
+    try:
+        db_path = get_cache_db_path()
+        conn = init_cache_db(db_path)
+        cached = get_last_scan(conn)
+        conn.close()
+    except Exception:
+        cached = None
 
-    result = []
-    for cat_id, data in cats.items():
-        result.append({
-            "id": cat_id,
-            "name": category_labels.get(cat_id, cat_id),
-            "count": data["count"],
-            "total_bytes": data["total_bytes"],
-            "total_formatted": format_size(data["total_bytes"]),
+    if cached:
+        emit({
+            "event": "complete",
+            "total_items": len(cached["items"]),
+            "total_bytes": cached["total_bytes"],
+            "total_formatted": format_size(cached["total_bytes"]),
+            "tree": cached["tree"],
+            "items": cached["items"],
+            "duration": cached["duration"],
+            "metrics": cached["metrics"],
+            "attestation": {"signature": cached["signature"]} if cached["signature"] else None,
+            "categories": cached["metrics"]["categories"] if cached["metrics"] else [],
+            "cached": True,
+            "scan_time": cached["scan_time"],
         })
-    result.sort(key=lambda x: x["total_bytes"], reverse=True)
-    return result
+    else:
+        emit({"event": "error", "message": "No cached scan results found. Run 'scan' first."})
+
+
+def run_daemon():
+    """Long-running watcher that re-scans on filesystem changes.
+    
+    This is a user-space process only — no LaunchAgents or system services.
+    Uses polling (not fsevents) for simplicity and portability.
+    """
+    import signal
+
+    scan_interval = 3600  # Re-scan every hour
+    running = True
+
+    def handle_signal(sig, frame):
+        nonlocal running
+        running = False
+
+    signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGTERM, handle_signal)
+
+    emit({"event": "daemon_started", "interval_seconds": scan_interval})
+
+    while running:
+        run_scan()
+        # Sleep in small increments so we can respond to signals
+        for _ in range(scan_interval):
+            if not running:
+                break
+            time.sleep(1)
+
+    emit({"event": "daemon_stopped"})
+
+
+# ─── CLI Entrypoint ──────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Storage Deep Scanner for Mac Optimizer",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+subcommands:
+  scan     Run one full discovery + analysis pass (default)
+  daemon   Start background watcher that re-scans periodically
+  status   Emit last cached scan results without re-scanning
+        """
+    )
+    parser.add_argument(
+        "command", nargs="?", default="scan",
+        choices=["scan", "daemon", "status"],
+        help="Subcommand to run (default: scan)"
+    )
+
+    args = parser.parse_args()
+
+    if args.command == "scan":
+        run_scan()
+    elif args.command == "status":
+        run_status()
+    elif args.command == "daemon":
+        run_daemon()
 
 
 if __name__ == "__main__":

@@ -150,6 +150,9 @@ const useStore = create((set, get) => ({
     storageItems: [],
     storageTree: null,
     storageCategories: [],
+    storageMetrics: null,
+    storageAttestation: null,
+    storageWarnings: [],
     storageSearchQuery: '',
     storageFilters: { category: 'all', riskLevel: 'all', minSize: 0 },
     storageSortBy: 'size',
@@ -165,6 +168,9 @@ const useStore = create((set, get) => ({
             storageItems: [],
             storageTree: null,
             storageCategories: [],
+            storageMetrics: null,
+            storageAttestation: null,
+            storageWarnings: [],
             storageSelectedPaths: new Set(),
             error: null,
         });
@@ -191,10 +197,15 @@ const useStore = create((set, get) => ({
                             bytesScanned: data.bytes_scanned,
                             scanRateMbps: data.scan_rate_mbps,
                             etaSeconds: data.eta_seconds,
+                            elapsed: data.elapsed || 0,
                             errorCount: data.error_count,
+                            errors: data.errors || {},
                             lastError: data.last_error,
                         }
                     });
+                    break;
+                case 'warning':
+                    set({ storageWarnings: [...state.storageWarnings, data] });
                     break;
                 case 'item':
                     // Add item with proper field mapping
@@ -251,6 +262,8 @@ const useStore = create((set, get) => ({
                         storageTree: tree,
                         storageItems: normalizedItems,
                         storageCategories: categories,
+                        storageMetrics: data.metrics || null,
+                        storageAttestation: data.attestation || null,
                         storageScanProgress: null,
                     });
                     break;

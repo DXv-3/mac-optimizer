@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { HardDrive, Download, Play, Square, Trash2, RefreshCw, CheckCircle2, Shield } from 'lucide-react';
+import { HardDrive, Download, Play, Square, Trash2, RefreshCw, CheckCircle2, Shield, ShieldCheck } from 'lucide-react';
 import useStore from '../../store/useStore';
 import SunburstChart from './SunburstChart';
 import ScanProgress from './ScanProgress';
@@ -38,6 +38,7 @@ export default function StorageAnalyzer() {
         storageState, storageScanProgress, storageItems, storageTree,
         storageCategories, storageSearchQuery, storageFilters,
         storageSortBy, storageSortDir, storageSelectedPaths,
+        storageMetrics, storageAttestation, storageWarnings,
         startStorageScan, cancelStorageScan, setStorageSearch,
         setStorageFilter, setStorageSort, toggleStoragePath,
         selectAllStoragePaths, clearStorageSelection,
@@ -237,6 +238,7 @@ export default function StorageAnalyzer() {
                             progress={storageScanProgress}
                             items={storageItems}
                             categories={storageCategories}
+                            warnings={storageWarnings}
                         />
                     </motion.div>
                 )}
@@ -318,6 +320,34 @@ export default function StorageAnalyzer() {
                                         </button>
                                     );
                                 })}
+                            </div>
+                            {/* Risk + Attestation Row */}
+                            <div className="flex items-center justify-between mt-2 pt-2 border-t border-white/[0.04]">
+                                {storageMetrics?.risk_breakdown && (
+                                    <div className="flex items-center gap-3 text-[10px]">
+                                        <span className="text-zinc-600 uppercase tracking-wider">Risk:</span>
+                                        <span className="flex items-center gap-1 text-emerald-400">
+                                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
+                                            {storageMetrics.risk_breakdown.safe || 0} safe
+                                        </span>
+                                        <span className="flex items-center gap-1 text-amber-400">
+                                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                                            {storageMetrics.risk_breakdown.caution || 0} caution
+                                        </span>
+                                        {(storageMetrics.risk_breakdown.critical || 0) > 0 && (
+                                            <span className="flex items-center gap-1 text-red-400">
+                                                <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
+                                                {storageMetrics.risk_breakdown.critical} critical
+                                            </span>
+                                        )}
+                                    </div>
+                                )}
+                                {storageAttestation && (
+                                    <div className="flex items-center gap-1.5 text-[10px] text-emerald-500/70">
+                                        <ShieldCheck size={11} />
+                                        <span>Signed ({storageAttestation.algorithm})</span>
+                                    </div>
+                                )}
                             </div>
                         </motion.div>
 

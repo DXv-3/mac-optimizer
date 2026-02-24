@@ -18,7 +18,7 @@ const formatSize = (bytes) => {
     return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
 };
 
-export default function ScanProgress({ progress, items, categories }) {
+export default function ScanProgress({ progress, items, categories, warnings = [] }) {
     const phase = progress?.phase || 'fast';
     const dir = progress?.currentPath || progress?.dir || 'Initializing...';
     const filesProcessed = progress?.filesProcessed || progress?.files || 0;
@@ -152,6 +152,18 @@ export default function ScanProgress({ progress, items, categories }) {
                     )}
                 </div>
             </motion.div>
+
+            {/* Warning banners (e.g. low disk space) */}
+            {warnings.length > 0 && (
+                <motion.div
+                    initial={{ opacity: 0, y: -10 }}
+                    animate={{ opacity: 1, y: 0 }}
+                    className="bg-amber-500/[0.07] border border-amber-500/20 text-amber-400 px-4 py-2.5 rounded-xl flex items-center gap-2 text-sm"
+                >
+                    <AlertTriangle size={14} className="flex-shrink-0" />
+                    <span>{warnings[warnings.length - 1].message}</span>
+                </motion.div>
+            )}
 
             {/* Live category breakdown bar */}
             {liveCategories.length > 0 && (
