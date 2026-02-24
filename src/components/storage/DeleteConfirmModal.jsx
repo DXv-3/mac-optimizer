@@ -105,7 +105,7 @@ export default function DeleteConfirmModal({ items, totalSize, onConfirm, onCanc
                                     {CATEGORY_LABELS[category] || category}
                                 </span>
                                 <span className="text-[10px] text-zinc-600">
-                                    ({catItems.length}) — {formatSize(catItems.reduce((s, i) => s + i.size, 0))}
+                                    ({catItems.length}) — {formatSize(catItems.reduce((s, i) => s + (i.sizeBytes || 0), 0))}
                                 </span>
                             </div>
                             <div className="space-y-1 ml-5">
@@ -116,12 +116,12 @@ export default function DeleteConfirmModal({ items, totalSize, onConfirm, onCanc
                                     >
                                         <div className="flex items-center gap-2 min-w-0 flex-1">
                                             <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${item.risk === 'safe' ? 'bg-emerald-400' :
-                                                    item.risk === 'caution' ? 'bg-amber-400' : 'bg-red-400'
+                                                item.risk === 'caution' ? 'bg-amber-400' : 'bg-red-400'
                                                 }`} />
                                             <span className="text-sm text-zinc-300 truncate">{item.name}</span>
                                         </div>
                                         <span className="text-xs font-mono text-zinc-500 ml-2 flex-shrink-0">
-                                            {item.size_formatted}
+                                            {item.sizeFormatted || formatSize(item.sizeBytes)}
                                         </span>
                                     </div>
                                 ))}
@@ -167,8 +167,8 @@ export default function DeleteConfirmModal({ items, totalSize, onConfirm, onCanc
                         whileHover={{ scale: 1.02, boxShadow: '0 0 25px rgba(239, 68, 68, 0.2)' }}
                         whileTap={{ scale: 0.98 }}
                         className={`px-5 py-2.5 rounded-xl text-sm font-bold flex items-center gap-2 transition-all ${hasCritical
-                                ? 'bg-gradient-to-r from-red-600 to-rose-600 text-white border border-red-500/30'
-                                : 'bg-gradient-to-r from-cyan-600/90 to-blue-600/90 text-white border border-cyan-500/20'
+                            ? 'bg-gradient-to-r from-red-600 to-rose-600 text-white border border-red-500/30'
+                            : 'bg-gradient-to-r from-cyan-600/90 to-blue-600/90 text-white border border-cyan-500/20'
                             }`}
                     >
                         <Trash2 size={14} />

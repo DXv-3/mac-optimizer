@@ -1,12 +1,37 @@
-import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { HardDrive, Search, Filter, Download, Play, Square, Trash2, ChevronRight, RefreshCw } from 'lucide-react';
+import { HardDrive, Download, Play, Square, Trash2, RefreshCw, CheckCircle2, Shield } from 'lucide-react';
 import useStore from '../../store/useStore';
 import SunburstChart from './SunburstChart';
 import ScanProgress from './ScanProgress';
 import ItemList from './ItemList';
 import SearchBar from './SearchBar';
 import DeleteConfirmModal from './DeleteConfirmModal';
+
+const CATEGORY_LABELS = {
+    browser_cache: { name: 'Browser', color: 'cyan' },
+    dev_cache: { name: 'Dev Tools', color: 'violet' },
+    app_cache: { name: 'Apps', color: 'pink' },
+    system_logs: { name: 'Logs', color: 'amber' },
+    mail_backups: { name: 'Mail/Backup', color: 'teal' },
+    general_cache: { name: 'Other', color: 'indigo' },
+};
+
+const COLOR_MAP = {
+    cyan: 'from-cyan-500 to-cyan-600',
+    violet: 'from-violet-500 to-violet-600',
+    pink: 'from-pink-500 to-pink-600',
+    amber: 'from-amber-500 to-amber-600',
+    teal: 'from-teal-500 to-teal-600',
+    indigo: 'from-indigo-500 to-indigo-600',
+};
+
+const formatSize = (bytes) => {
+    if (!bytes || bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 2 : 0)} ${units[i]}`;
+};
 
 export default function StorageAnalyzer() {
     const {
@@ -23,54 +48,42 @@ export default function StorageAnalyzer() {
     const [sunburstZoomPath, setSunburstZoomPath] = useState(null);
     const [contextMenu, setContextMenu] = useState(null);
 
-    // Filter and sort items based on current search/filter/sort state
+    // Filter and sort items
     const filteredItems = useMemo(() => {
         let filtered = [...storageItems];
 
-        // Search filter (regex support)
         if (storageSearchQuery) {
             try {
                 const regex = new RegExp(storageSearchQuery, 'i');
-                filtered = filtered.filter(item =>
-                    regex.test(item.name) || regex.test(item.path)
-                );
+                filtered = filtered.filter(item => regex.test(item.name) || regex.test(item.path));
             } catch {
-                // Invalid regex, fall back to string match
                 const q = storageSearchQuery.toLowerCase();
-                filtered = filtered.filter(item =>
-                    item.name.toLowerCase().includes(q) || item.path.toLowerCase().includes(q)
-                );
+                filtered = filtered.filter(item => item.name.toLowerCase().includes(q) || item.path.toLowerCase().includes(q));
             }
         }
 
-        // Category filter
         if (storageFilters.category !== 'all') {
             filtered = filtered.filter(item => item.category === storageFilters.category);
         }
-
-        // Risk level filter
         if (storageFilters.riskLevel !== 'all') {
             filtered = filtered.filter(item => item.risk === storageFilters.riskLevel);
         }
-
-        // Min size filter
         if (storageFilters.minSize > 0) {
-            filtered = filtered.filter(item => (item.sizeBytes || item.size || 0) >= storageFilters.minSize);
+            filtered = filtered.filter(item => (item.sizeBytes || 0) >= storageFilters.minSize);
         }
 
-        // Sort
         filtered.sort((a, b) => {
             let cmp = 0;
             switch (storageSortBy) {
-                case 'size': cmp = (a.sizeBytes || a.size || 0) - (b.sizeBytes || b.size || 0); break;
+                case 'size': cmp = (a.sizeBytes || 0) - (b.sizeBytes || 0); break;
                 case 'name': cmp = a.name.localeCompare(b.name); break;
                 case 'risk': {
                     const riskOrder = { safe: 0, caution: 1, critical: 2 };
                     cmp = (riskOrder[a.risk] || 0) - (riskOrder[b.risk] || 0);
                     break;
                 }
-                case 'date': cmp = (a.lastUsed || a.last_accessed || '').localeCompare(b.lastUsed || b.last_accessed || ''); break;
-                default: cmp = (a.sizeBytes || a.size || 0) - (b.sizeBytes || b.size || 0);
+                case 'date': cmp = (a.lastUsed || '').localeCompare(b.lastUsed || ''); break;
+                default: cmp = (a.sizeBytes || 0) - (b.sizeBytes || 0);
             }
             return storageSortDir === 'desc' ? -cmp : cmp;
         });
@@ -78,20 +91,34 @@ export default function StorageAnalyzer() {
         return filtered;
     }, [storageItems, storageSearchQuery, storageFilters, storageSortBy, storageSortDir]);
 
-    const totalFilteredSize = useMemo(() =>
-        filteredItems.reduce((sum, item) => sum + (item.sizeBytes || item.size || 0), 0),
-        [filteredItems]
-    );
+    const totalBytes = useMemo(() =>
+        storageItems.reduce((sum, item) => sum + (item.sizeBytes || 0), 0), [storageItems]);
 
     const selectedItems = useMemo(() =>
-        storageItems.filter(item => storageSelectedPaths.has(item.path)),
-        [storageItems, storageSelectedPaths]
-    );
+        storageItems.filter(item => storageSelectedPaths.has(item.path)), [storageItems, storageSelectedPaths]);
 
     const selectedTotalSize = useMemo(() =>
-        selectedItems.reduce((sum, item) => sum + (item.sizeBytes || item.size || 0), 0),
-        [selectedItems]
-    );
+        selectedItems.reduce((sum, item) => sum + (item.sizeBytes || 0), 0), [selectedItems]);
+
+    const safeItems = useMemo(() =>
+        storageItems.filter(item => item.risk === 'safe'), [storageItems]);
+
+    const safeTotalBytes = useMemo(() =>
+        safeItems.reduce((sum, item) => sum + (item.sizeBytes || 0), 0), [safeItems]);
+
+    // Category breakdown for the strip
+    const categoryBreakdown = useMemo(() => {
+        const cats = {};
+        for (const item of storageItems) {
+            const cat = item.category || 'general_cache';
+            if (!cats[cat]) cats[cat] = { bytes: 0, count: 0 };
+            cats[cat].bytes += (item.sizeBytes || 0);
+            cats[cat].count += 1;
+        }
+        return Object.entries(cats)
+            .map(([id, data]) => ({ id, ...data, pct: totalBytes > 0 ? (data.bytes / totalBytes) * 100 : 0 }))
+            .sort((a, b) => b.bytes - a.bytes);
+    }, [storageItems, totalBytes]);
 
     const handleContextMenu = useCallback((e, item) => {
         e.preventDefault();
@@ -125,12 +152,9 @@ export default function StorageAnalyzer() {
         return () => window.removeEventListener('keydown', handleKeyDown);
     }, [filteredItems, storageSelectedPaths, selectAllStoragePaths, clearStorageSelection]);
 
-    const formatSize = (bytes) => {
-        if (bytes === 0) return '0 B';
-        const units = ['B', 'KB', 'MB', 'GB', 'TB'];
-        const i = Math.floor(Math.log(bytes) / Math.log(1024));
-        return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 2 : 0)} ${units[i]}`;
-    };
+    const handleSelectAllSafe = useCallback(() => {
+        selectAllStoragePaths(safeItems.map(i => i.path));
+    }, [safeItems, selectAllStoragePaths]);
 
     return (
         <div className="h-full flex flex-col max-w-[1400px] mx-auto pb-6">
@@ -190,9 +214,7 @@ export default function StorageAnalyzer() {
                             >
                                 <HardDrive size={40} className="text-cyan-400" />
                             </motion.div>
-                            <h3 className="text-2xl font-bold text-white mb-3">
-                                Ready to Analyze
-                            </h3>
+                            <h3 className="text-2xl font-bold text-white mb-3">Ready to Analyze</h3>
                             <p className="text-zinc-400 text-sm leading-relaxed">
                                 Scan your system to discover browser caches, dev tool artifacts,
                                 app data, system logs, and more — all visualized as an interactive,
@@ -226,36 +248,82 @@ export default function StorageAnalyzer() {
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
                         exit={{ opacity: 0 }}
-                        className="flex-1 flex flex-col space-y-5 overflow-hidden"
+                        className="flex-1 flex flex-col space-y-4 overflow-hidden"
                     >
                         {/* Summary Bar */}
                         <motion.div
                             initial={{ opacity: 0, x: -20 }}
                             animate={{ opacity: 1, x: 0 }}
-                            className="shrink-0 bg-cyan-500/[0.07] border border-cyan-500/15 text-cyan-400 p-4 rounded-2xl flex items-center justify-between backdrop-blur-xl"
+                            className="shrink-0 bg-cyan-500/[0.07] border border-cyan-500/15 text-cyan-400 p-4 rounded-2xl backdrop-blur-xl"
                         >
-                            <div className="flex items-center">
-                                <HardDrive className="mr-3 h-5 w-5 flex-shrink-0" />
-                                <span className="text-sm">
-                                    Found <strong>{storageItems.length}</strong> items totaling{' '}
-                                    <strong>{formatSize(storageItems.reduce((s, i) => s + (i.sizeBytes || i.size || 0), 0))}</strong>
-                                </span>
+                            <div className="flex items-center justify-between mb-3">
+                                <div className="flex items-center">
+                                    <HardDrive className="mr-3 h-5 w-5 flex-shrink-0" />
+                                    <span className="text-sm">
+                                        Found <strong>{storageItems.length}</strong> items totaling{' '}
+                                        <strong className="text-lg">{formatSize(totalBytes)}</strong>
+                                    </span>
+                                </div>
+                                <div className="flex items-center gap-2">
+                                    {safeItems.length > 0 && (
+                                        <motion.button
+                                            onClick={handleSelectAllSafe}
+                                            whileHover={{ scale: 1.05 }}
+                                            whileTap={{ scale: 0.95 }}
+                                            className="bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 text-emerald-400 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors"
+                                        >
+                                            <Shield size={12} /> Select All Safe ({formatSize(safeTotalBytes)})
+                                        </motion.button>
+                                    )}
+                                    <motion.button
+                                        onClick={() => exportStorageReport()}
+                                        whileHover={{ scale: 1.05 }}
+                                        whileTap={{ scale: 0.95 }}
+                                        className="bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] text-zinc-300 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
+                                    >
+                                        <Download size={12} /> Export
+                                    </motion.button>
+                                </div>
                             </div>
-                            <div className="flex items-center gap-2">
-                                <motion.button
-                                    onClick={() => exportStorageReport()}
-                                    whileHover={{ scale: 1.05 }}
-                                    whileTap={{ scale: 0.95 }}
-                                    className="bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] text-zinc-300 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
-                                >
-                                    <Download size={12} /> Export
-                                </motion.button>
+
+                            {/* Category Breakdown Bar */}
+                            <div className="flex h-2.5 rounded-full overflow-hidden bg-white/[0.04]">
+                                {categoryBreakdown.map((cat, idx) => {
+                                    const meta = CATEGORY_LABELS[cat.id] || { color: 'indigo' };
+                                    const gradientClass = COLOR_MAP[meta.color] || COLOR_MAP.indigo;
+                                    return (
+                                        <motion.div
+                                            key={cat.id}
+                                            initial={{ width: 0 }}
+                                            animate={{ width: `${cat.pct}%` }}
+                                            transition={{ duration: 0.8, delay: idx * 0.08, ease: [0.22, 1, 0.36, 1] }}
+                                            className={`h-full bg-gradient-to-r ${gradientClass} ${idx > 0 ? 'border-l border-black/20' : ''}`}
+                                            title={`${meta.name || cat.id}: ${formatSize(cat.bytes)} (${cat.pct.toFixed(1)}%)`}
+                                        />
+                                    );
+                                })}
+                            </div>
+                            {/* Category Legend */}
+                            <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2">
+                                {categoryBreakdown.map(cat => {
+                                    const meta = CATEGORY_LABELS[cat.id] || { name: cat.id, color: 'indigo' };
+                                    return (
+                                        <button
+                                            key={cat.id}
+                                            onClick={() => setStorageFilter({ ...storageFilters, category: storageFilters.category === cat.id ? 'all' : cat.id })}
+                                            className={`flex items-center gap-1.5 text-[10px] transition-all cursor-pointer ${storageFilters.category === cat.id ? 'text-white font-bold' : 'text-zinc-500 hover:text-zinc-300'}`}
+                                        >
+                                            <span className={`w-2 h-2 rounded-full bg-gradient-to-r ${COLOR_MAP[meta.color]}`} />
+                                            {meta.name} <span className="font-mono">{formatSize(cat.bytes)}</span>
+                                        </button>
+                                    );
+                                })}
                             </div>
                         </motion.div>
 
                         {/* Two-column layout: Sunburst + List */}
-                        <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-5 overflow-hidden">
-                            {/* Left: Sunburst Visualization */}
+                        <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4 overflow-hidden">
+                            {/* Left: Sunburst */}
                             <motion.div
                                 initial={{ opacity: 0, scale: 0.95 }}
                                 animate={{ opacity: 1, scale: 1 }}
@@ -312,11 +380,14 @@ export default function StorageAnalyzer() {
                                     initial={{ opacity: 0, y: 20 }}
                                     animate={{ opacity: 1, y: 0 }}
                                     exit={{ opacity: 0, y: 20 }}
-                                    className="shrink-0 flex items-center justify-between bg-white/[0.03] backdrop-blur-xl border border-white/[0.08] rounded-2xl px-5 py-3"
+                                    className="shrink-0 flex items-center justify-between bg-white/[0.04] backdrop-blur-xl border border-white/[0.1] rounded-2xl px-5 py-3"
                                 >
-                                    <div className="text-sm text-zinc-400">
-                                        <strong className="text-white">{storageSelectedPaths.size}</strong> items selected
-                                        ({formatSize(selectedTotalSize)})
+                                    <div className="flex items-center gap-3">
+                                        <CheckCircle2 size={16} className="text-cyan-400" />
+                                        <div className="text-sm text-zinc-400">
+                                            <strong className="text-white">{storageSelectedPaths.size}</strong> items selected
+                                            <span className="text-cyan-400 font-bold ml-1.5">({formatSize(selectedTotalSize)})</span>
+                                        </div>
                                     </div>
                                     <div className="flex items-center gap-2">
                                         <motion.button
@@ -369,30 +440,20 @@ export default function StorageAnalyzer() {
                         className="bg-zinc-900/95 backdrop-blur-xl border border-white/[0.1] rounded-xl shadow-2xl overflow-hidden min-w-[200px]"
                     >
                         <button
-                            onClick={() => {
-                                window.ipcRenderer.invoke('open-in-finder', contextMenu.item.path);
-                                setContextMenu(null);
-                            }}
+                            onClick={() => { window.ipcRenderer.invoke('open-in-finder', contextMenu.item.path); setContextMenu(null); }}
                             className="w-full text-left px-4 py-2.5 text-sm text-zinc-300 hover:bg-white/[0.06] transition-colors"
                         >
                             📂 Open in Finder
                         </button>
                         <button
-                            onClick={() => {
-                                navigator.clipboard.writeText(contextMenu.item.path);
-                                setContextMenu(null);
-                            }}
+                            onClick={() => { navigator.clipboard.writeText(contextMenu.item.path); setContextMenu(null); }}
                             className="w-full text-left px-4 py-2.5 text-sm text-zinc-300 hover:bg-white/[0.06] transition-colors"
                         >
                             📋 Copy Path
                         </button>
                         <div className="border-t border-white/[0.06]" />
                         <button
-                            onClick={() => {
-                                toggleStoragePath(contextMenu.item.path);
-                                setShowDeleteModal(true);
-                                setContextMenu(null);
-                            }}
+                            onClick={() => { toggleStoragePath(contextMenu.item.path); setShowDeleteModal(true); setContextMenu(null); }}
                             className="w-full text-left px-4 py-2.5 text-sm text-red-400 hover:bg-red-500/10 transition-colors"
                         >
                             🗑 Delete
