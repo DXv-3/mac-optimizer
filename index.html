@@ -1,16 +1,19 @@
 <!DOCTYPE html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <!-- Ensure the app handles native window layouts well -->
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <!-- CSP config for Electron security -->
-    <meta http-equiv="Content-Security-Policy" content="script-src 'self' 'unsafe-inline';" />
-    <title>Mac Optimizer</title>
-  </head>
-  <!-- Native dark mode background so it doesn't flash white on launch -->
-  <body class="bg-zinc-950 text-white font-sans overflow-hidden">
-    <div id="root" class="w-full h-screen"></div>
-    <script type="module" src="/src/main.jsx"></script>
-  </body>
+
+<head>
+  <meta charset="UTF-8" />
+  <!-- Ensure the app handles native window layouts well -->
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- CSP config for Electron security -->
+  <meta http-equiv="Content-Security-Policy" content="script-src 'self' 'unsafe-inline' 'unsafe-eval';" />
+  <title>Mac Optimizer</title>
+</head>
+<!-- Native dark mode background so it doesn't flash white on launch -->
+
+<body class="bg-zinc-950 text-white font-sans overflow-hidden">
+  <div id="root" class="w-full h-screen"></div>
+  <script type="module" src="/src/main.jsx"></script>
+</body>
+
 </html>

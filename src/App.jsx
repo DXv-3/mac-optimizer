@@ -1,10 +1,11 @@
 import React from 'react';
-import { Shield, Trash2, LayoutGrid } from 'lucide-react';
+import { Shield, Trash2, LayoutGrid, HardDrive } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import useStore from './store/useStore';
 import SmartCareDashboard from './components/SmartCareDashboard';
 import SystemCleanupModule from './components/SystemCleanupModule';
 import AppTelemetryManager from './components/AppTelemetryManager';
+import StorageAnalyzer from './components/storage/StorageAnalyzer';
 
 const pageTransition = {
     initial: { opacity: 0, y: 12, filter: 'blur(6px)' },
@@ -31,6 +32,7 @@ function App() {
                     <SidebarItem icon={<Shield size={18} />} label="Smart Care" isActive={activeTab === 'smartCare'} onClick={() => setActiveTab('smartCare')} />
                     <SidebarItem icon={<Trash2 size={18} />} label="Cleanup" isActive={activeTab === 'cleanup'} onClick={() => setActiveTab('cleanup')} />
                     <SidebarItem icon={<LayoutGrid size={18} />} label="Applications" isActive={activeTab === 'apps'} onClick={() => setActiveTab('apps')} />
+                    <SidebarItem icon={<HardDrive size={18} />} label="Storage" isActive={activeTab === 'storage'} onClick={() => setActiveTab('storage')} />
                 </nav>
 
                 {/* Sidebar Footer */}
@@ -55,6 +57,7 @@ function App() {
                             {activeTab === 'smartCare' && 'Smart Care Overview'}
                             {activeTab === 'cleanup' && 'System Cleanup'}
                             {activeTab === 'apps' && 'Application Telemetry'}
+                            {activeTab === 'storage' && 'Storage Analyzer'}
                         </motion.div>
                     </AnimatePresence>
                 </div>
@@ -90,6 +93,11 @@ function App() {
                         {activeTab === 'apps' && (
                             <motion.div key="apps" {...pageTransition} className="h-full">
                                 <AppTelemetryManager />
+                            </motion.div>
+                        )}
+                        {activeTab === 'storage' && (
+                            <motion.div key="storage" {...pageTransition} className="h-full">
+                                <StorageAnalyzer />
                             </motion.div>
                         )}
                     </AnimatePresence>

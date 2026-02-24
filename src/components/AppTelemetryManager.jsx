@@ -88,16 +88,21 @@ export default function AppTelemetryManager() {
                             className="shrink-0 bg-fuchsia-500/[0.07] border border-fuchsia-500/15 text-fuchsia-300 p-4 rounded-2xl flex items-center backdrop-blur-xl mb-5"
                         >
                             <Scan className="mr-3 h-5 w-5 flex-shrink-0" />
-                            <span className="text-sm">
-                                Found <strong>{appTelemetryData.applications.length}</strong> applications.
-                                {appTelemetryData.applications.filter(a => a.category === 'Dead Weight').length > 0 && (
-                                    <> <strong>{appTelemetryData.applications.filter(a => a.category === 'Dead Weight').length}</strong> classified as Dead Weight.</>
-                                )}
-                            </span>
+                            {(() => {
+                                const deadWeightCount = appTelemetryData.items.filter(a => a.category === 'Dead Weight').length;
+                                return (
+                                    <span className="text-sm">
+                                        Found <strong>{appTelemetryData.items.length}</strong> applications.
+                                        {deadWeightCount > 0 && (
+                                            <> <strong>{deadWeightCount}</strong> classified as Dead Weight.</>
+                                        )}
+                                    </span>
+                                );
+                            })()}
                         </motion.div>
 
                         <div className="flex-1 overflow-hidden">
-                            <TableGrid data={appTelemetryData.applications} />
+                            <TableGrid data={appTelemetryData.items} />
                         </div>
                     </motion.div>
                 ) : null}
