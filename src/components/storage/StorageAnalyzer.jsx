@@ -36,6 +36,7 @@ const formatSize = (bytes) => {
 export default function StorageAnalyzer() {
     const {
         storageState, storageScanProgress, storageItems, storageTree,
+        storageFullTree, storageDiskMap, storageDiskTotal, storageDiskUsed, storageDiskFree,
         storageCategories, storageSearchQuery, storageFilters,
         storageSortBy, storageSortDir, storageSelectedPaths,
         storageMetrics, storageAttestation, storageWarnings,
@@ -47,6 +48,7 @@ export default function StorageAnalyzer() {
 
     const [showDeleteModal, setShowDeleteModal] = useState(false);
     const [sunburstZoomPath, setSunburstZoomPath] = useState(null);
+    const [sunburstView, setSunburstView] = useState('full'); // 'full' | 'cleanable'
     const [contextMenu, setContextMenu] = useState(null);
 
     // Filter and sort items
@@ -353,19 +355,83 @@ export default function StorageAnalyzer() {
 
                         {/* Two-column layout: Sunburst + List */}
                         <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4 overflow-hidden">
-                            {/* Left: Sunburst */}
+                            {/* Left: Sunburst + Disk Overview */}
                             <motion.div
                                 initial={{ opacity: 0, scale: 0.95 }}
                                 animate={{ opacity: 1, scale: 1 }}
                                 transition={{ delay: 0.1 }}
                                 className="bg-white/[0.03] backdrop-blur-[20px] border border-white/[0.08] rounded-[20px] p-5 shadow-[inset_0_1px_1px_rgba(255,255,255,0.06)] overflow-hidden flex flex-col"
                             >
-                                <div className="text-xs uppercase tracking-[0.15em] text-zinc-500 font-semibold mb-3">
-                                    Disk Space Map
+                                {/* Disk Usage Overview Bar */}
+                                {storageDiskTotal > 0 && (
+                                    <div className="mb-4">
+                                        <div className="flex items-center justify-between mb-1.5">
+                                            <span className="text-xs uppercase tracking-[0.15em] text-zinc-500 font-semibold">Disk Usage</span>
+                                            <span className="text-[10px] text-zinc-500">
+                                                {formatSize(storageDiskUsed)} used / {formatSize(storageDiskTotal)} total
+                                            </span>
+                                        </div>
+                                        <div className="h-3 rounded-full overflow-hidden bg-white/[0.04] flex">
+                                            {/* Used space (non-cleanable) */}
+                                            <div
+                                                className="bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-700"
+                                                style={{ width: `${Math.max(0, ((storageDiskUsed - totalBytes) / storageDiskTotal) * 100)}%` }}
+                                                title={`Used: ${formatSize(storageDiskUsed - totalBytes)}`}
+                                            />
+                                            {/* Cleanable space */}
+                                            <div
+                                                className="bg-gradient-to-r from-amber-500 to-orange-400 transition-all duration-700"
+                                                style={{ width: `${(totalBytes / storageDiskTotal) * 100}%` }}
+                                                title={`Cleanable: ${formatSize(totalBytes)}`}
+                                            />
+                                        </div>
+                                        <div className="flex items-center gap-4 mt-1.5 text-[10px] text-zinc-500">
+                                            <span className="flex items-center gap-1">
+                                                <span className="w-2 h-2 rounded-full bg-blue-500" />
+                                                Used ({formatSize(storageDiskUsed - totalBytes)})
+                                            </span>
+                                            <span className="flex items-center gap-1">
+                                                <span className="w-2 h-2 rounded-full bg-amber-500" />
+                                                Cleanable ({formatSize(totalBytes)})
+                                            </span>
+                                            <span className="flex items-center gap-1">
+                                                <span className="w-2 h-2 rounded-full bg-white/[0.1]" />
+                                                Free ({formatSize(storageDiskFree)})
+                                            </span>
+                                        </div>
+                                    </div>
+                                )}
+                                {/* View Toggle + Title */}
+                                <div className="flex items-center justify-between mb-3">
+                                    <div className="text-xs uppercase tracking-[0.15em] text-zinc-500 font-semibold">
+                                        {sunburstView === 'full' ? 'Full Disk Map' : 'Cleanable Items'}
+                                    </div>
+                                    {storageFullTree && (
+                                        <div className="flex bg-white/[0.04] rounded-lg p-0.5 text-[10px]">
+                                            <button
+                                                onClick={() => setSunburstView('full')}
+                                                className={`px-2.5 py-1 rounded-md transition-all ${sunburstView === 'full'
+                                                        ? 'bg-white/[0.1] text-white font-medium'
+                                                        : 'text-zinc-500 hover:text-zinc-300'
+                                                    }`}
+                                            >
+                                                Full Disk
+                                            </button>
+                                            <button
+                                                onClick={() => setSunburstView('cleanable')}
+                                                className={`px-2.5 py-1 rounded-md transition-all ${sunburstView === 'cleanable'
+                                                        ? 'bg-white/[0.1] text-white font-medium'
+                                                        : 'text-zinc-500 hover:text-zinc-300'
+                                                    }`}
+                                            >
+                                                Cleanable
+                                            </button>
+                                        </div>
+                                    )}
                                 </div>
                                 <div className="flex-1 min-h-0">
                                     <SunburstChart
-                                        data={storageTree}
+                                        data={sunburstView === 'full' && storageFullTree ? storageFullTree : storageTree}
                                         zoomPath={sunburstZoomPath}
                                         onZoom={setSunburstZoomPath}
                                         onItemClick={(item) => {
@@ -373,6 +439,22 @@ export default function StorageAnalyzer() {
                                         }}
                                     />
                                 </div>
+
+                                {/* Disk Map Category Legend */}
+                                {sunburstView === 'full' && storageDiskMap && (
+                                    <div className="flex flex-wrap gap-x-3 gap-y-1 mt-3 pt-3 border-t border-white/[0.04]">
+                                        {Object.entries(storageDiskMap)
+                                            .sort(([, a], [, b]) => b.bytes - a.bytes)
+                                            .map(([catId, cat]) => (
+                                                <span key={catId} className="flex items-center gap-1 text-[10px] text-zinc-400">
+                                                    <span className={`w-2 h-2 rounded-full`}
+                                                        style={{ background: `var(--color-${cat.color || 'zinc'}-500, #71717a)` }} />
+                                                    {cat.name} <span className="font-mono text-zinc-600">{cat.formatted}</span>
+                                                </span>
+                                            ))
+                                        }
+                                    </div>
+                                )}
                             </motion.div>
 
                             {/* Right: Search + Item List */}

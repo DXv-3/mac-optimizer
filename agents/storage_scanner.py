@@ -934,7 +934,388 @@ def scan_general_caches(tracker: ProgressTracker) -> list:
     return items
 
 
-# ─── Tree Builder for Sunburst ───────────────────────────────────────────────
+# ─── Pass 2: Full Disk Usage Map ─────────────────────────────────────────────
+
+# macOS-style category classification for directories
+DISK_CATEGORIES = {
+    # Home directory mappings
+    "Desktop": "documents",
+    "Documents": "documents",
+    "Downloads": "documents",
+    "Movies": "media",
+    "Music": "media",
+    "Pictures": "photos",
+    "Photos Library.photoslibrary": "photos",
+    "Developer": "developer",
+    "Projects": "developer",
+    "dev": "developer",
+    "code": "developer",
+    "repos": "developer",
+    "workspace": "developer",
+    "src": "developer",
+    "go": "developer",
+    ".cargo": "developer",
+    ".npm": "developer",
+    ".rustup": "developer",
+    ".pyenv": "developer",
+    ".rbenv": "developer",
+    ".nvm": "developer",
+    "Public": "other",
+    ".Trash": "other",
+}
+
+# Library subdirectory classification
+LIBRARY_CATEGORIES = {
+    "Caches": "system_data",
+    "Logs": "system_data",
+    "Application Support": "app_data",
+    "Containers": "app_data",
+    "Group Containers": "app_data",
+    "Preferences": "system_data",
+    "Saved Application State": "system_data",
+    "Developer": "developer",
+    "Mail": "mail_messages",
+    "Messages": "mail_messages",
+    "Calendars": "other",
+    "Accounts": "other",
+    "Fonts": "other",
+    "Keychains": "system_data",
+    "MobileDevice": "other",
+    "Safari": "app_data",
+}
+
+CATEGORY_DISPLAY = {
+    "applications": {"name": "Applications", "color": "blue"},
+    "developer": {"name": "Developer", "color": "cyan"},
+    "documents": {"name": "Documents", "color": "violet"},
+    "media": {"name": "Music & Movies", "color": "pink"},
+    "photos": {"name": "Photos", "color": "orange"},
+    "mail_messages": {"name": "Mail & Messages", "color": "green"},
+    "app_data": {"name": "App Data", "color": "amber"},
+    "system_data": {"name": "System Data", "color": "slate"},
+    "other": {"name": "Other", "color": "indigo"},
+    "cleanable": {"name": "Cleanable Junk", "color": "red"},
+}
+
+
+def scan_full_disk(tracker: ProgressTracker) -> dict:
+    """Pass 2: Map entire home directory + Applications into macOS-style categories.
+    
+    Returns a dict with:
+      - 'categories': {cat_id: {name, bytes, count, dirs: [{name, path, bytes}]}}
+      - 'total_bytes': total mapped bytes
+      - 'hidden_space': APFS purgeable + unaccounted space
+      - 'disk_total': total disk capacity
+      - 'disk_used': total used space
+      - 'disk_free': free space
+    """
+    tracker.phase = "full_map"
+    emit({
+        "event": "progress",
+        "phase": "full_map",
+        "dir": "Mapping entire disk...",
+        "files": tracker.files_processed,
+        "bytes": tracker.bytes_scanned,
+        "rate_mbps": 0, "eta_seconds": -1,
+        "elapsed": round(time.monotonic() - tracker.start_time, 1),
+    })
+
+    categories = {}
+    for cat_id, meta in CATEGORY_DISPLAY.items():
+        categories[cat_id] = {
+            "name": meta["name"],
+            "color": meta["color"],
+            "bytes": 0,
+            "count": 0,
+            "dirs": [],
+        }
+
+    total_mapped = 0
+
+    # ── 1. Scan home directory top-level ──
+    try:
+        for entry in os.scandir(HOME):
+            if not entry.is_dir(follow_symlinks=False) and not entry.is_file(follow_symlinks=False):
+                continue
+
+            name = entry.name
+            entry_path = entry.path
+
+            # Skip the Library dir — we scan it separately
+            if name == "Library":
+                continue
+
+            tracker.update(entry_path)
+
+            # Determine category
+            cat = DISK_CATEGORIES.get(name, "other")
+            # Developer heuristic: if it has .git, package.json, etc.
+            if cat == "other" and entry.is_dir(follow_symlinks=False):
+                try:
+                    children = {e.name for e in os.scandir(entry_path)}
+                    if children & {".git", "package.json", "Cargo.toml", "go.mod", "setup.py", "Makefile", "CMakeLists.txt"}:
+                        cat = "developer"
+                except (PermissionError, OSError):
+                    pass
+
+            # Size it
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    size = get_dir_size_fast(entry_path)
+                else:
+                    size = entry.stat(follow_symlinks=False).st_size
+            except (PermissionError, OSError) as e:
+                tracker.record_error(entry_path, e)
+                continue
+
+            if size > 0:
+                categories[cat]["bytes"] += size
+                categories[cat]["count"] += 1
+                categories[cat]["dirs"].append({
+                    "name": name,
+                    "path": entry_path,
+                    "bytes": size,
+                    "formatted": format_size(size),
+                })
+                total_mapped += size
+                tracker.update(entry_path, files=1, bytes_added=size)
+
+    except (PermissionError, OSError) as e:
+        tracker.record_error(HOME, e)
+
+    # ── 2. Scan ~/Library subdirectories ──
+    try:
+        for entry in os.scandir(LIBRARY):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+
+            name = entry.name
+            entry_path = entry.path
+            tracker.update(entry_path)
+
+            cat = LIBRARY_CATEGORIES.get(name, "system_data")
+
+            try:
+                size = get_dir_size_fast(entry_path)
+            except (PermissionError, OSError) as e:
+                tracker.record_error(entry_path, e)
+                continue
+
+            if size > 1024 * 1024:  # Only report Library dirs > 1MB
+                categories[cat]["bytes"] += size
+                categories[cat]["count"] += 1
+                categories[cat]["dirs"].append({
+                    "name": f"Library/{name}",
+                    "path": entry_path,
+                    "bytes": size,
+                    "formatted": format_size(size),
+                })
+                total_mapped += size
+                tracker.update(entry_path, files=1, bytes_added=size)
+
+    except (PermissionError, OSError) as e:
+        tracker.record_error(LIBRARY, e)
+
+    # ── 3. Scan /Applications ──
+    apps_path = "/Applications"
+    try:
+        total_apps = 0
+        app_count = 0
+        for entry in os.scandir(apps_path):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            try:
+                size = get_dir_size_fast(entry.path)
+                if size > 1024 * 1024:  # > 1MB
+                    total_apps += size
+                    app_count += 1
+                    categories["applications"]["dirs"].append({
+                        "name": entry.name.replace(".app", ""),
+                        "path": entry.path,
+                        "bytes": size,
+                        "formatted": format_size(size),
+                    })
+            except (PermissionError, OSError):
+                pass
+            tracker.update(entry.path)
+
+        categories["applications"]["bytes"] = total_apps
+        categories["applications"]["count"] = app_count
+        total_mapped += total_apps
+    except (PermissionError, OSError):
+        pass
+
+    # ── 4. Sort each category's dirs by size ──
+    for cat in categories.values():
+        cat["dirs"].sort(key=lambda x: x["bytes"], reverse=True)
+        # Keep top 50 per category to avoid massive payloads
+        if len(cat["dirs"]) > 50:
+            others_bytes = sum(d["bytes"] for d in cat["dirs"][50:])
+            cat["dirs"] = cat["dirs"][:50]
+            cat["dirs"].append({
+                "name": f"({len(cat['dirs'])} more items)",
+                "path": "",
+                "bytes": others_bytes,
+                "formatted": format_size(others_bytes),
+            })
+
+    # ── 5. Detect hidden/purgeable space ──
+    hidden_space = detect_hidden_space(total_mapped)
+
+    # ── 6. Get disk totals ──
+    disk = check_disk_space()
+
+    return {
+        "categories": categories,
+        "total_mapped": total_mapped,
+        "hidden_space": hidden_space,
+        "disk_total": disk["total_bytes"],
+        "disk_free": disk["free_bytes"],
+        "disk_used": disk["total_bytes"] - disk["free_bytes"] if disk["total_bytes"] > 0 else 0,
+    }
+
+
+def detect_hidden_space(total_mapped: int) -> dict:
+    """Detect APFS purgeable space, Time Machine snapshots, and unaccounted space."""
+    result = {
+        "purgeable_bytes": 0,
+        "snapshots": [],
+        "snapshot_count": 0,
+        "unaccounted_bytes": 0,
+    }
+
+    # APFS purgeable space
+    try:
+        r = subprocess.run(
+            ["diskutil", "info", "/"],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0:
+            for line in r.stdout.split("\n"):
+                if "Purgeable" in line and "Bytes" in line:
+                    # Parse: "   Container Free Space:  3.1 GB (3145728000 Bytes)"
+                    import re
+                    match = re.search(r'\((\d+)\s*Bytes?\)', line)
+                    if match:
+                        result["purgeable_bytes"] = int(match.group(1))
+                        break
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Time Machine local snapshots
+    try:
+        r = subprocess.run(
+            ["tmutil", "listlocalsnapshots", "/"],
+            capture_output=True, text=True, timeout=10
+        )
+        if r.returncode == 0:
+            snaps = [l.strip() for l in r.stdout.strip().split("\n") if l.strip() and "com.apple" in l]
+            result["snapshots"] = snaps[:10]  # Keep first 10
+            result["snapshot_count"] = len(snaps)
+    except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+        pass
+
+    # Unaccounted space: disk used - total mapped
+    disk = check_disk_space()
+    disk_used = disk["total_bytes"] - disk["free_bytes"] if disk["total_bytes"] > 0 else 0
+    if disk_used > total_mapped:
+        result["unaccounted_bytes"] = disk_used - total_mapped
+
+    return result
+
+
+def build_full_disk_tree(disk_map: dict, cleanable_items: list) -> dict:
+    """Build a unified tree showing full disk usage with cleanable items highlighted."""
+    root = {"name": "Disk", "children": [], "size": 0}
+
+    # Add each non-empty disk category
+    for cat_id, cat_data in disk_map["categories"].items():
+        if cat_data["bytes"] == 0:
+            continue
+
+        cat_node = {
+            "name": cat_data["name"],
+            "size": cat_data["bytes"],
+            "color": cat_data["color"],
+            "category": cat_id,
+            "children": [],
+        }
+
+        for dir_entry in cat_data["dirs"]:
+            cat_node["children"].append({
+                "name": dir_entry["name"],
+                "size": dir_entry["bytes"],
+                "path": dir_entry.get("path", ""),
+            })
+
+        root["children"].append(cat_node)
+        root["size"] += cat_data["bytes"]
+
+    # Add cleanable items as a highlighted category
+    if cleanable_items:
+        clean_total = sum(i["size"] for i in cleanable_items)
+        clean_node = {
+            "name": "Cleanable Junk",
+            "size": clean_total,
+            "color": "red",
+            "category": "cleanable",
+            "cleanable": True,
+            "children": [],
+        }
+        # Group by sub-category
+        clean_cats = defaultdict(list)
+        for item in cleanable_items:
+            clean_cats[item.get("category", "other")].append(item)
+
+        category_labels = {
+            "browser_cache": "Browser Caches",
+            "dev_cache": "Developer Tools",
+            "app_cache": "Application Caches",
+            "system_logs": "System Logs",
+            "mail_backups": "Mail & Backups",
+            "general_cache": "Other Caches",
+        }
+
+        for sub_cat, items in clean_cats.items():
+            sub_total = sum(i["size"] for i in items)
+            sub_node = {
+                "name": category_labels.get(sub_cat, sub_cat),
+                "size": sub_total,
+                "cleanable": True,
+                "children": [
+                    {"name": i["name"], "size": i["size"], "path": i["path"],
+                     "risk": i["risk"], "cleanable": True}
+                    for i in sorted(items, key=lambda x: x["size"], reverse=True)
+                ],
+            }
+            clean_node["children"].append(sub_node)
+
+        root["children"].append(clean_node)
+        # Don't add to root size — cleanable is a subset of existing categories
+
+    # Add hidden space if significant
+    hidden = disk_map.get("hidden_space", {})
+    unaccounted = hidden.get("unaccounted_bytes", 0)
+    if unaccounted > 100 * 1024 * 1024:  # > 100 MB
+        root["children"].append({
+            "name": "System & Hidden",
+            "size": unaccounted,
+            "color": "slate",
+            "category": "hidden",
+            "children": [
+                {"name": "macOS System", "size": unaccounted,
+                 "path": "/System"},
+            ],
+        })
+        root["size"] += unaccounted
+
+    # Sort by size
+    root["children"].sort(key=lambda x: x["size"], reverse=True)
+
+    return root
+
+
+# ─── Tree Builder for Sunburst (cleanable items only) ───────────────────────
 
 def build_tree(items: list) -> dict:
     """Build a hierarchical tree structure from discovered items for sunburst visualization."""
@@ -1271,14 +1652,24 @@ def run_scan():
     all_items.extend(scan_dev_caches(tracker))
     all_items.extend(scan_general_caches(tracker))
 
+    # ── Pass 3: Full Disk Map — complete picture ──
+    disk_map = scan_full_disk(tracker)
+
     # ── Build completion payload ──
     duration = round(time.monotonic() - start_time, 2)
     total_bytes = sum(item["size"] for item in all_items)
     tree = build_tree(all_items)
+    full_tree = build_full_disk_tree(disk_map, all_items)
     all_items.sort(key=lambda x: x["size"], reverse=True)
 
     # Build D3 metrics contract
     metrics = build_metrics(all_items, duration, tracker)
+    # Add disk-level info to metrics
+    metrics["disk_total"] = disk_map["disk_total"]
+    metrics["disk_used"] = disk_map["disk_used"]
+    metrics["disk_free"] = disk_map["disk_free"]
+    metrics["disk_mapped"] = disk_map["total_mapped"]
+    metrics["hidden_space"] = disk_map["hidden_space"]
 
     # Sign scan results (attestation)
     try:
@@ -1291,7 +1682,6 @@ def run_scan():
         try:
             save_scan_to_cache(conn, all_items, tree, metrics, total_bytes, duration,
                              attestation.get("signature") if attestation else None)
-            # Mark all scanned paths
             for item in all_items:
                 mark_path_scanned(conn, item["path"], item["size"])
             conn.commit()
@@ -1305,6 +1695,22 @@ def run_scan():
         "total_bytes": total_bytes,
         "total_formatted": format_size(total_bytes),
         "tree": tree,
+        "full_tree": full_tree,
+        "disk_map": {
+            cat_id: {
+                "name": cat["name"],
+                "color": cat["color"],
+                "bytes": cat["bytes"],
+                "count": cat["count"],
+                "formatted": format_size(cat["bytes"]),
+                "dirs": cat["dirs"][:20],  # Top 20 per category for the event
+            }
+            for cat_id, cat in disk_map["categories"].items()
+            if cat["bytes"] > 0
+        },
+        "disk_total": disk_map["disk_total"],
+        "disk_used": disk_map["disk_used"],
+        "disk_free": disk_map["disk_free"],
         "items": all_items,
         "duration": duration,
         "metrics": metrics,
