@@ -999,21 +999,17 @@ CATEGORY_DISPLAY = {
 
 
 def scan_full_disk(tracker: ProgressTracker) -> dict:
-    """Pass 2: Map entire home directory + Applications into macOS-style categories.
+    """Pass 2: DEEP recursive scan of entire home directory, Library, and Applications.
     
-    Returns a dict with:
-      - 'categories': {cat_id: {name, bytes, count, dirs: [{name, path, bytes}]}}
-      - 'total_bytes': total mapped bytes
-      - 'hidden_space': APFS purgeable + unaccounted space
-      - 'disk_total': total disk capacity
-      - 'disk_used': total used space
-      - 'disk_free': free space
+    Walks every directory recursively to build a complete nested tree of where
+    every byte lives. This is DaisyDisk/WhatSize-level granularity — the user
+    can see exactly what's inside every folder.
     """
     tracker.phase = "full_map"
     emit({
         "event": "progress",
         "phase": "full_map",
-        "dir": "Mapping entire disk...",
+        "dir": "Mapping entire disk recursively...",
         "files": tracker.files_processed,
         "bytes": tracker.bytes_scanned,
         "rate_mbps": 0, "eta_seconds": -1,
@@ -1031,8 +1027,120 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
         }
 
     total_mapped = 0
+    seen_inodes = set()  # Avoid double-counting hard links
 
-    # ── 1. Scan home directory top-level ──
+    def walk_dir_recursive(dir_path: str, max_depth: int = 5, current_depth: int = 0):
+        """Recursively walk a directory and return a tree node with children.
+        
+        Returns: {"name", "path", "bytes", "children": [...], "file_count"}
+        """
+        name = os.path.basename(dir_path) or dir_path
+        node = {
+            "name": name,
+            "path": dir_path,
+            "bytes": 0,
+            "children": [],
+            "file_count": 0,
+        }
+
+        try:
+            entries = list(os.scandir(dir_path))
+        except (PermissionError, OSError) as e:
+            tracker.record_error(dir_path, e)
+            # Try to at least get the total size
+            try:
+                node["bytes"] = get_dir_size_fast(dir_path)
+            except OSError:
+                pass
+            return node
+
+        child_dirs = []
+        loose_files_size = 0
+        loose_file_count = 0
+
+        for entry in entries:
+            try:
+                if entry.is_symlink():
+                    continue  # Skip symlinks
+
+                if entry.is_file(follow_symlinks=False):
+                    st = entry.stat(follow_symlinks=False)
+                    # Avoid double-counting hard links
+                    if st.st_nlink > 1:
+                        if st.st_ino in seen_inodes:
+                            continue
+                        seen_inodes.add(st.st_ino)
+                    fsize = st.st_size
+                    node["bytes"] += fsize
+                    node["file_count"] += 1
+                    loose_files_size += fsize
+                    loose_file_count += 1
+
+                elif entry.is_dir(follow_symlinks=False):
+                    child_dirs.append(entry)
+
+            except (PermissionError, OSError) as e:
+                tracker.record_error(entry.path, e)
+                continue
+
+        # Recurse into child directories
+        if current_depth < max_depth:
+            for child_entry in child_dirs:
+                tracker.update(child_entry.path, files=0, bytes_added=0)
+                child_node = walk_dir_recursive(child_entry.path, max_depth, current_depth + 1)
+                if child_node["bytes"] > 0:
+                    node["children"].append(child_node)
+                    node["bytes"] += child_node["bytes"]
+                    node["file_count"] += child_node["file_count"]
+        else:
+            # At max depth, just size the child dirs without recursing
+            for child_entry in child_dirs:
+                try:
+                    csize = get_dir_size_fast(child_entry.path)
+                    if csize > 0:
+                        node["children"].append({
+                            "name": child_entry.name,
+                            "path": child_entry.path,
+                            "bytes": csize,
+                            "children": [],
+                            "file_count": 0,
+                        })
+                        node["bytes"] += csize
+                except (PermissionError, OSError):
+                    pass
+
+        # Add loose files as a single entry if significant
+        if loose_files_size > 1024 * 1024 and node["children"]:  # > 1 MB
+            node["children"].append({
+                "name": f"({loose_file_count} files)",
+                "path": dir_path,
+                "bytes": loose_files_size,
+                "children": [],
+                "file_count": loose_file_count,
+                "is_files": True,
+            })
+
+        # Sort children by size, largest first
+        node["children"].sort(key=lambda x: x["bytes"], reverse=True)
+
+        # Keep top 30 children to avoid massive payloads, roll up the rest
+        if len(node["children"]) > 30:
+            kept = node["children"][:30]
+            rest = node["children"][30:]
+            rest_bytes = sum(c["bytes"] for c in rest)
+            rest_count = sum(c.get("file_count", 0) for c in rest)
+            kept.append({
+                "name": f"({len(rest)} more items)",
+                "path": "",
+                "bytes": rest_bytes,
+                "children": [],
+                "file_count": rest_count,
+            })
+            node["children"] = kept
+
+        return node
+
+    # ── 1. Scan every top-level home directory RECURSIVELY ──
     try:
         for entry in os.scandir(HOME):
             if not entry.is_dir(follow_symlinks=False) and not entry.is_file(follow_symlinks=False):
@@ -1041,15 +1149,21 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
             name = entry.name
             entry_path = entry.path
 
-            # Skip the Library dir — we scan it separately
             if name == "Library":
-                continue
+                continue  # Scanned separately below
 
             tracker.update(entry_path)
+            emit({
+                "event": "progress",
+                "phase": "full_map",
+                "dir": f"Scanning ~/{name}...",
+                "files": tracker.files_processed,
+                "bytes": tracker.bytes_scanned,
+                "rate_mbps": 0, "eta_seconds": -1,
+                "elapsed": round(time.monotonic() - tracker.start_time, 1),
+            })
 
-            # Determine category
             cat = DISK_CATEGORIES.get(name, "other")
-            # Developer heuristic: if it has .git, package.json, etc.
             if cat == "other" and entry.is_dir(follow_symlinks=False):
                 try:
                     children = {e.name for e in os.scandir(entry_path)}
@@ -1058,32 +1172,44 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
                 except (PermissionError, OSError):
                     pass
 
-            # Size it
-            try:
-                if entry.is_dir(follow_symlinks=False):
-                    size = get_dir_size_fast(entry_path)
-                else:
+            if entry.is_dir(follow_symlinks=False):
+                # DEEP RECURSIVE WALK
+                dir_node = walk_dir_recursive(entry_path, max_depth=4)
+                if dir_node["bytes"] > 0:
+                    categories[cat]["bytes"] += dir_node["bytes"]
+                    categories[cat]["count"] += 1
+                    dir_node["formatted"] = format_size(dir_node["bytes"])
+                    categories[cat]["dirs"].append(dir_node)
+                    total_mapped += dir_node["bytes"]
+            else:
+                try:
                     size = entry.stat(follow_symlinks=False).st_size
-            except (PermissionError, OSError) as e:
-                tracker.record_error(entry_path, e)
-                continue
+                    if size > 0:
+                        categories[cat]["bytes"] += size
+                        categories[cat]["dirs"].append({
+                            "name": name, "path": entry_path,
+                            "bytes": size, "formatted": format_size(size),
+                            "children": [],
+                        })
+                        total_mapped += size
+                except OSError:
+                    pass
 
-            if size > 0:
-                categories[cat]["bytes"] += size
-                categories[cat]["count"] += 1
-                categories[cat]["dirs"].append({
-                    "name": name,
-                    "path": entry_path,
-                    "bytes": size,
-                    "formatted": format_size(size),
-                })
-                total_mapped += size
-                tracker.update(entry_path, files=1, bytes_added=size)
+            tracker.update(entry_path, files=1, bytes_added=0)
 
     except (PermissionError, OSError) as e:
         tracker.record_error(HOME, e)
 
-    # ── 2. Scan ~/Library subdirectories ──
+    # ── 2. Scan ~/Library RECURSIVELY ──
+    emit({
+        "event": "progress",
+        "phase": "full_map",
+        "dir": "Scanning ~/Library...",
+        "files": tracker.files_processed,
+        "bytes": tracker.bytes_scanned,
+        "rate_mbps": 0, "eta_seconds": -1,
+        "elapsed": round(time.monotonic() - tracker.start_time, 1),
+    })
     try:
         for entry in os.scandir(LIBRARY):
             if not entry.is_dir(follow_symlinks=False):
@@ -1095,28 +1221,31 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
 
             cat = LIBRARY_CATEGORIES.get(name, "system_data")
 
-            try:
-                size = get_dir_size_fast(entry_path)
-            except (PermissionError, OSError) as e:
-                tracker.record_error(entry_path, e)
-                continue
+            # DEEP RECURSIVE WALK (only 3 levels deep for Library to avoid noise)
+            dir_node = walk_dir_recursive(entry_path, max_depth=3)
 
-            if size > 1024 * 1024:  # Only report Library dirs > 1MB
-                categories[cat]["bytes"] += size
+            if dir_node["bytes"] > 1024 * 1024:  # > 1 MB
+                dir_node["name"] = f"Library/{name}"
+                dir_node["formatted"] = format_size(dir_node["bytes"])
+                categories[cat]["bytes"] += dir_node["bytes"]
                 categories[cat]["count"] += 1
-                categories[cat]["dirs"].append({
-                    "name": f"Library/{name}",
-                    "path": entry_path,
-                    "bytes": size,
-                    "formatted": format_size(size),
-                })
-                total_mapped += size
-                tracker.update(entry_path, files=1, bytes_added=size)
+                categories[cat]["dirs"].append(dir_node)
+                total_mapped += dir_node["bytes"]
+                tracker.update(entry_path, files=1, bytes_added=dir_node["bytes"])
 
     except (PermissionError, OSError) as e:
         tracker.record_error(LIBRARY, e)
 
-    # ── 3. Scan /Applications ──
+    # ── 3. Scan /Applications RECURSIVELY ──
+    emit({
+        "event": "progress",
+        "phase": "full_map",
+        "dir": "Scanning /Applications...",
+        "files": tracker.files_processed,
+        "bytes": tracker.bytes_scanned,
+        "rate_mbps": 0, "eta_seconds": -1,
+        "elapsed": round(time.monotonic() - tracker.start_time, 1),
+    })
     apps_path = "/Applications"
     try:
         total_apps = 0
@@ -1125,8 +1254,9 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
             if not entry.is_dir(follow_symlinks=False):
                 continue
             try:
+                # Apps don't need deep recursion — just total size
                 size = get_dir_size_fast(entry.path)
-                if size > 1024 * 1024:  # > 1MB
+                if size > 1024 * 1024:
                     total_apps += size
                     app_count += 1
                     categories["applications"]["dirs"].append({
@@ -1134,6 +1264,7 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
                         "path": entry.path,
                         "bytes": size,
                         "formatted": format_size(size),
+                        "children": [],
                     })
             except (PermissionError, OSError):
                 pass
@@ -1148,16 +1279,6 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
     # ── 4. Sort each category's dirs by size ──
     for cat in categories.values():
         cat["dirs"].sort(key=lambda x: x["bytes"], reverse=True)
-        # Keep top 50 per category to avoid massive payloads
-        if len(cat["dirs"]) > 50:
-            others_bytes = sum(d["bytes"] for d in cat["dirs"][50:])
-            cat["dirs"] = cat["dirs"][:50]
-            cat["dirs"].append({
-                "name": f"({len(cat['dirs'])} more items)",
-                "path": "",
-                "bytes": others_bytes,
-                "formatted": format_size(others_bytes),
-            })
 
     # ── 5. Detect hidden/purgeable space ──
     hidden_space = detect_hidden_space(total_mapped)
@@ -1225,8 +1346,25 @@ def detect_hidden_space(total_mapped: int) -> dict:
 
 
 def build_full_disk_tree(disk_map: dict, cleanable_items: list) -> dict:
-    """Build a unified tree showing full disk usage with cleanable items highlighted."""
+    """Build a unified tree showing full disk usage with cleanable items highlighted.
+    
+    Uses the recursive children hierarchy from scan_full_disk's deep walk,
+    so the sunburst can drill down into every folder on disk.
+    """
     root = {"name": "Disk", "children": [], "size": 0}
+
+    def convert_walk_node(node):
+        """Convert a walk_dir_recursive node into a sunburst tree node."""
+        result = {
+            "name": node.get("name", "?"),
+            "size": node.get("bytes", 0),
+        }
+        if node.get("path"):
+            result["path"] = node["path"]
+        children = node.get("children", [])
+        if children:
+            result["children"] = [convert_walk_node(c) for c in children if c.get("bytes", 0) > 0]
+        return result
 
     # Add each non-empty disk category
     for cat_id, cat_data in disk_map["categories"].items():
@@ -1242,16 +1380,13 @@ def build_full_disk_tree(disk_map: dict, cleanable_items: list) -> dict:
         }
 
         for dir_entry in cat_data["dirs"]:
-            cat_node["children"].append({
-                "name": dir_entry["name"],
-                "size": dir_entry["bytes"],
-                "path": dir_entry.get("path", ""),
-            })
+            # Pass through the full recursive children hierarchy
+            cat_node["children"].append(convert_walk_node(dir_entry))
 
         root["children"].append(cat_node)
         root["size"] += cat_data["bytes"]
 
-    # Add cleanable items as a highlighted category
+    # Add cleanable items as a highlighted overlay category
     if cleanable_items:
         clean_total = sum(i["size"] for i in cleanable_items)
         clean_node = {
@@ -1262,7 +1397,6 @@ def build_full_disk_tree(disk_map: dict, cleanable_items: list) -> dict:
             "cleanable": True,
             "children": [],
         }
-        # Group by sub-category
         clean_cats = defaultdict(list)
         for item in cleanable_items:
             clean_cats[item.get("category", "other")].append(item)
@@ -1291,25 +1425,22 @@ def build_full_disk_tree(disk_map: dict, cleanable_items: list) -> dict:
             clean_node["children"].append(sub_node)
 
         root["children"].append(clean_node)
-        # Don't add to root size — cleanable is a subset of existing categories
 
-    # Add hidden space if significant
+    # Add hidden/system space if significant
     hidden = disk_map.get("hidden_space", {})
     unaccounted = hidden.get("unaccounted_bytes", 0)
-    if unaccounted > 100 * 1024 * 1024:  # > 100 MB
+    if unaccounted > 100 * 1024 * 1024:
         root["children"].append({
             "name": "System & Hidden",
             "size": unaccounted,
             "color": "slate",
             "category": "hidden",
             "children": [
-                {"name": "macOS System", "size": unaccounted,
-                 "path": "/System"},
+                {"name": "macOS System", "size": unaccounted, "path": "/System"},
             ],
         })
         root["size"] += unaccounted
 
-    # Sort by size
     root["children"].sort(key=lambda x: x["size"], reverse=True)
 
     return root
