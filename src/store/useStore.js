@@ -158,6 +158,10 @@ const useStore = create((set, get) => ({
     storageMetrics: null,
     storageAttestation: null,
     storageWarnings: [],
+    storageRecommendations: [],
+    storageStaleProjects: [],
+    storageTimeline: [],
+    storagePrediction: null,
     storageSearchQuery: '',
     storageFilters: { category: 'all', riskLevel: 'all', minSize: 0 },
     storageSortBy: 'size',
@@ -181,6 +185,10 @@ const useStore = create((set, get) => ({
             storageMetrics: null,
             storageAttestation: null,
             storageWarnings: [],
+            storageRecommendations: [],
+            storageStaleProjects: [],
+            storageTimeline: [],
+            storagePrediction: null,
             storageSelectedPaths: new Set(),
             error: null,
         });
@@ -279,6 +287,10 @@ const useStore = create((set, get) => ({
                         storageCategories: categories,
                         storageMetrics: data.metrics || null,
                         storageAttestation: data.attestation || null,
+                        storageRecommendations: data.recommendations || [],
+                        storageStaleProjects: data.stale_projects || [],
+                        storageTimeline: data.timeline || [],
+                        storagePrediction: data.prediction || null,
                         storageScanProgress: null,
                     });
                     break;

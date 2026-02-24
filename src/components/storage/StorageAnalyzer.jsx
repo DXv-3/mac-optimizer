@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { HardDrive, Download, Play, Square, Trash2, RefreshCw, CheckCircle2, Shield, ShieldCheck } from 'lucide-react';
+import { HardDrive, Download, Play, Square, Trash2, RefreshCw, CheckCircle2, Shield, ShieldCheck, Zap, Clock } from 'lucide-react';
 import useStore from '../../store/useStore';
 import SunburstChart from './SunburstChart';
 import ScanProgress from './ScanProgress';
@@ -40,6 +40,7 @@ export default function StorageAnalyzer() {
         storageCategories, storageSearchQuery, storageFilters,
         storageSortBy, storageSortDir, storageSelectedPaths,
         storageMetrics, storageAttestation, storageWarnings,
+        storageRecommendations, storageStaleProjects, storagePrediction,
         startStorageScan, cancelStorageScan, setStorageSearch,
         setStorageFilter, setStorageSort, toggleStoragePath,
         selectAllStoragePaths, clearStorageSelection,
@@ -411,8 +412,8 @@ export default function StorageAnalyzer() {
                                             <button
                                                 onClick={() => setSunburstView('full')}
                                                 className={`px-2.5 py-1 rounded-md transition-all ${sunburstView === 'full'
-                                                        ? 'bg-white/[0.1] text-white font-medium'
-                                                        : 'text-zinc-500 hover:text-zinc-300'
+                                                    ? 'bg-white/[0.1] text-white font-medium'
+                                                    : 'text-zinc-500 hover:text-zinc-300'
                                                     }`}
                                             >
                                                 Full Disk
@@ -420,8 +421,8 @@ export default function StorageAnalyzer() {
                                             <button
                                                 onClick={() => setSunburstView('cleanable')}
                                                 className={`px-2.5 py-1 rounded-md transition-all ${sunburstView === 'cleanable'
-                                                        ? 'bg-white/[0.1] text-white font-medium'
-                                                        : 'text-zinc-500 hover:text-zinc-300'
+                                                    ? 'bg-white/[0.1] text-white font-medium'
+                                                    : 'text-zinc-500 hover:text-zinc-300'
                                                     }`}
                                             >
                                                 Cleanable
@@ -484,6 +485,91 @@ export default function StorageAnalyzer() {
                                 </div>
                             </motion.div>
                         </div>
+
+                        {/* Agent Insights Panel */}
+                        {(storageRecommendations.length > 0 || storagePrediction || storageStaleProjects.length > 0) && (
+                            <motion.div
+                                initial={{ opacity: 0, y: 10 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                transition={{ delay: 0.3 }}
+                                className="shrink-0 bg-white/[0.02] backdrop-blur-[20px] border border-white/[0.06] rounded-[20px] p-5 max-h-[260px] overflow-y-auto"
+                            >
+                                <div className="text-xs uppercase tracking-[0.15em] text-zinc-500 font-semibold mb-3 flex items-center gap-2">
+                                    <Zap size={12} className="text-amber-400" />
+                                    Agent Insights
+                                </div>
+
+                                {/* Prediction Banner */}
+                                {storagePrediction && storagePrediction.days_until_full < 90 && (
+                                    <div className="flex items-center gap-3 p-3 mb-3 rounded-xl bg-red-500/10 border border-red-500/20">
+                                        <Clock size={16} className="text-red-400 shrink-0" />
+                                        <div className="text-xs text-red-300">
+                                            At current growth ({storagePrediction.growth_rate_formatted}),
+                                            disk will be full in <strong className="text-red-200">{storagePrediction.days_until_full} days</strong>.
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Stale Projects */}
+                                {storageStaleProjects.length > 0 && (
+                                    <div className="mb-3">
+                                        <div className="text-[10px] uppercase tracking-wider text-zinc-600 mb-1.5">Stale Dev Projects</div>
+                                        <div className="space-y-1">
+                                            {storageStaleProjects.slice(0, 5).map((proj, idx) => (
+                                                <div key={idx} className="flex items-center justify-between p-2 rounded-lg bg-white/[0.02] hover:bg-white/[0.04] transition-colors">
+                                                    <div className="flex items-center gap-2 min-w-0">
+                                                        <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 shrink-0" />
+                                                        <span className="text-xs text-zinc-300 truncate">{proj.name}</span>
+                                                        <span className="text-[10px] text-zinc-600">{proj.days_stale}d stale</span>
+                                                    </div>
+                                                    <span className="text-[10px] font-mono text-amber-400 shrink-0">
+                                                        {proj.reclaimable_formatted}
+                                                    </span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+
+                                {/* Recommendations */}
+                                <div className="space-y-1.5">
+                                    {storageRecommendations.slice(0, 6).map((rec, idx) => {
+                                        const priorityColors = {
+                                            urgent: 'bg-red-500/20 text-red-300 border-red-500/30',
+                                            quick_wins: 'bg-green-500/10 text-green-300 border-green-500/20',
+                                            dev_cleanup: 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20',
+                                            maintenance: 'bg-zinc-500/10 text-zinc-300 border-zinc-500/20',
+                                        };
+                                        const colorClass = priorityColors[rec.category] || priorityColors.maintenance;
+                                        return (
+                                            <div key={rec.id || idx}
+                                                className={`flex items-center justify-between p-2.5 rounded-xl border transition-colors hover:bg-white/[0.02] ${colorClass}`}
+                                            >
+                                                <div className="min-w-0 flex-1">
+                                                    <div className="text-xs font-medium truncate">{rec.title}</div>
+                                                    <div className="text-[10px] opacity-60 truncate mt-0.5">{rec.description}</div>
+                                                </div>
+                                                <div className="flex items-center gap-2 shrink-0 ml-3">
+                                                    <span className="text-xs font-mono font-semibold">
+                                                        {rec.impact_formatted}
+                                                    </span>
+                                                    <button
+                                                        onClick={() => {
+                                                            rec.items?.forEach(p => {
+                                                                if (!storageSelectedPaths.has(p)) toggleStoragePath(p);
+                                                            });
+                                                        }}
+                                                        className="text-[10px] px-2 py-0.5 rounded-md bg-white/[0.06] hover:bg-white/[0.12] text-zinc-300 transition-colors"
+                                                    >
+                                                        Select
+                                                    </button>
+                                                </div>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            </motion.div>
+                        )}
 
                         {/* Bottom Action Bar */}
                         <AnimatePresence>

@@ -1363,6 +1363,440 @@ def build_tree(items: list) -> dict:
     return convert_children(root)
 
 
+# ─── Agent Intelligence: Semantic File Classifier ────────────────────────────
+
+# Semantic categories derived from filename patterns, extensions, and content
+SEMANTIC_PATTERNS = {
+    "financial": {
+        "keywords": ["tax", "invoice", "receipt", "bank", "statement", "1099", "w2", "w-2",
+                     "payroll", "salary", "budget", "expense", "financial", "irs", "quickbooks",
+                     "turbotax", "accountant", "mortgage", "loan"],
+        "extensions": {".ofx", ".qfx", ".qbo", ".qif"},
+    },
+    "academic": {
+        "keywords": ["thesis", "essay", "homework", "assignment", "syllabus", "lecture",
+                     "exam", "quiz", "grade", "course", "university", "college", "school",
+                     "research", "dissertation", "paper", "study"],
+        "extensions": {".tex", ".bib", ".cls"},
+    },
+    "professional": {
+        "keywords": ["resume", "cv", "cover letter", "portfolio", "contract", "proposal",
+                     "nda", "agreement", "meeting", "agenda", "presentation", "report",
+                     "client", "project", "deliverable"],
+        "extensions": {".pptx", ".ppt", ".key", ".numbers"},
+    },
+    "personal": {
+        "keywords": ["photo", "vacation", "family", "wedding", "birthday", "diary",
+                     "journal", "recipe", "travel", "passport", "insurance"],
+        "extensions": set(),
+    },
+    "technical": {
+        "keywords": ["readme", "changelog", "config", "setup", "docker", "kubernetes",
+                     "terraform", "ansible", "nginx", "apache", "schema", "migration",
+                     "api", "endpoint", "workflow"],
+        "extensions": {".yml", ".yaml", ".toml", ".ini", ".cfg", ".conf",
+                      ".dockerfile", ".tf", ".hcl"},
+    },
+    "media": {
+        "keywords": ["album", "playlist", "podcast", "movie", "episode", "trailer",
+                     "soundtrack", "recording", "mix"],
+        "extensions": {".mp4", ".mkv", ".avi", ".mov", ".mp3", ".flac", ".wav",
+                      ".aac", ".m4a", ".m4v"},
+    },
+}
+
+TEMP_INDICATORS = {"tmp", "temp", "cache", "backup", ".bak", "old", "copy", "draft",
+                   "~", ".swp", ".swo", ".DS_Store", ".localized"}
+
+
+def classify_file_semantic(path: str) -> dict:
+    """Classify a file by semantic meaning using filename, extension, and path heuristics.
+    
+    Returns: {"label": str, "confidence": float, "reason": str}
+    """
+    name = os.path.basename(path).lower()
+    ext = os.path.splitext(name)[1]
+    path_lower = path.lower()
+
+    # Check for temp/transient indicators first
+    for indicator in TEMP_INDICATORS:
+        if indicator in name:
+            return {"label": "temporary", "confidence": 0.85, "reason": f"filename contains '{indicator}'"}
+
+    # Score each semantic category
+    best_label = "other"
+    best_score = 0.0
+    best_reason = ""
+
+    for label, patterns in SEMANTIC_PATTERNS.items():
+        score = 0.0
+        reason = ""
+
+        # Extension match (strong signal)
+        if ext in patterns["extensions"]:
+            score += 0.6
+            reason = f"extension '{ext}' matches {label}"
+
+        # Keyword match in filename or path
+        for kw in patterns["keywords"]:
+            if kw in name:
+                score += 0.5
+                reason = f"filename contains '{kw}'"
+                break
+            elif kw in path_lower:
+                score += 0.3
+                reason = f"path contains '{kw}'"
+                break
+
+        if score > best_score:
+            best_score = score
+            best_label = label
+            best_reason = reason
+
+    confidence = min(best_score, 0.95)
+    if confidence < 0.2:
+        best_label = "other"
+        best_reason = "no strong semantic signals"
+        confidence = 0.1
+
+    return {"label": best_label, "confidence": round(confidence, 2), "reason": best_reason}
+
+
+# ─── Agent Intelligence: Stale Project Detector ─────────────────────────────
+
+# Dev project markers and their cleanable artifacts
+PROJECT_MARKERS = {
+    ".git": True,  # Git repo
+    "package.json": True,
+    "Cargo.toml": True,
+    "go.mod": True,
+    "setup.py": True,
+    "pyproject.toml": True,
+    "Gemfile": True,
+    "Makefile": True,
+    "CMakeLists.txt": True,
+    "pom.xml": True,
+    "build.gradle": True,
+    ".xcodeproj": True,
+}
+
+# Cleanable artifact directories within dev projects
+CLEANABLE_ARTIFACTS = {
+    "node_modules": "npm dependencies",
+    ".venv": "Python virtualenv",
+    "venv": "Python virtualenv",
+    "__pycache__": "Python bytecode cache",
+    "target": "Rust/Maven build",
+    "build": "Build output",
+    "dist": "Distribution output",
+    ".next": "Next.js build cache",
+    ".nuxt": "Nuxt build cache",
+    ".cache": "General build cache",
+    "coverage": "Test coverage reports",
+    ".tox": "Python tox environments",
+    ".gradle": "Gradle cache",
+    "Pods": "CocoaPods dependencies",
+    "DerivedData": "Xcode build data",
+    ".dart_tool": "Dart cache",
+}
+
+# Stale threshold in days
+STALE_THRESHOLD_DAYS = 90
+
+
+def detect_stale_projects(tracker: ProgressTracker) -> list:
+    """Find dev projects not accessed in N months and estimate reclaimable space.
+    
+    Returns list of:
+      {"path", "name", "last_accessed", "days_stale", "reclaimable_bytes",
+       "cleanable_dirs": [{"name", "path", "bytes"}], "markers": [str]}
+    """
+    tracker.phase = "stale_detect"
+    projects = []
+    
+    # Directories to search for dev projects
+    search_roots = [
+        HOME,
+        os.path.join(HOME, "Desktop"),
+        os.path.join(HOME, "Documents"),
+        os.path.join(HOME, "Developer"),
+        os.path.join(HOME, "Projects"),
+        os.path.join(HOME, "dev"),
+        os.path.join(HOME, "code"),
+        os.path.join(HOME, "repos"),
+        os.path.join(HOME, "workspace"),
+        os.path.join(HOME, "src"),
+    ]
+
+    seen = set()
+
+    for search_root in search_roots:
+        if not os.path.isdir(search_root):
+            continue
+
+        try:
+            for entry in os.scandir(search_root):
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+
+                entry_path = entry.path
+                if entry_path in seen:
+                    continue
+                seen.add(entry_path)
+
+                tracker.update(entry_path)
+
+                # Check for project markers
+                try:
+                    children = {e.name for e in os.scandir(entry_path)}
+                except (PermissionError, OSError):
+                    continue
+
+                markers = [m for m in PROJECT_MARKERS if m in children]
+                if not markers:
+                    continue
+
+                # Check staleness — use most recent access time of marker files
+                try:
+                    most_recent = 0
+                    for child_name in children:
+                        child_path = os.path.join(entry_path, child_name)
+                        try:
+                            st = os.stat(child_path, follow_symlinks=False)
+                            most_recent = max(most_recent, st.st_atime, st.st_mtime)
+                        except OSError:
+                            pass
+
+                    if most_recent == 0:
+                        continue
+
+                    days_since = (time.time() - most_recent) / 86400
+
+                    if days_since < STALE_THRESHOLD_DAYS:
+                        continue  # Project is active
+
+                except OSError:
+                    continue
+
+                # Find cleanable artifact directories
+                cleanable_dirs = []
+                reclaimable = 0
+                for artifact_name, description in CLEANABLE_ARTIFACTS.items():
+                    artifact_path = os.path.join(entry_path, artifact_name)
+                    if os.path.isdir(artifact_path):
+                        try:
+                            size = get_dir_size_fast(artifact_path)
+                            if size > 1024 * 1024:  # > 1 MB
+                                cleanable_dirs.append({
+                                    "name": artifact_name,
+                                    "description": description,
+                                    "path": artifact_path,
+                                    "bytes": size,
+                                    "formatted": format_size(size),
+                                })
+                                reclaimable += size
+                        except OSError:
+                            pass
+
+                if cleanable_dirs:
+                    last_accessed_dt = datetime.fromtimestamp(most_recent)
+                    projects.append({
+                        "path": entry_path,
+                        "name": os.path.basename(entry_path),
+                        "last_accessed": last_accessed_dt.strftime("%Y-%m-%d"),
+                        "days_stale": round(days_since),
+                        "reclaimable_bytes": reclaimable,
+                        "reclaimable_formatted": format_size(reclaimable),
+                        "cleanable_dirs": cleanable_dirs,
+                        "markers": markers,
+                    })
+
+        except (PermissionError, OSError) as e:
+            tracker.record_error(search_root, e)
+
+    # Sort by reclaimable space
+    projects.sort(key=lambda p: p["reclaimable_bytes"], reverse=True)
+
+    emit({
+        "event": "progress",
+        "phase": "stale_detect",
+        "dir": f"Found {len(projects)} stale projects",
+        "files": tracker.files_processed,
+        "bytes": tracker.bytes_scanned,
+        "rate_mbps": 0, "eta_seconds": -1,
+        "elapsed": round(time.monotonic() - tracker.start_time, 1),
+    })
+
+    return projects
+
+
+# ─── Agent Intelligence: Smart Recommendations ──────────────────────────────
+
+def build_recommendations(items: list, disk_map: dict, stale_projects: list) -> list:
+    """Generate ranked cleanup recommendations with confidence and impact.
+    
+    Returns list of recommendation dicts:
+      {"id", "title", "description", "category", "impact_bytes", "impact_formatted",
+       "confidence", "risk", "items": [paths], "action_type"}
+    """
+    recs = []
+
+    # ── Quick Wins: Large single-item cleanups ──
+    for item in items:
+        if item["size"] > 500 * 1024 * 1024 and item["risk"] == "safe":  # > 500 MB safe items
+            recs.append({
+                "id": f"quick_{hashlib.md5(item['path'].encode()).hexdigest()[:8]}",
+                "title": f"Remove {item['name']}",
+                "description": f"{item.get('description', 'Large cache/junk item')} — {format_size(item['size'])}",
+                "category": "quick_wins",
+                "impact_bytes": item["size"],
+                "impact_formatted": format_size(item["size"]),
+                "confidence": 0.95 if item["risk"] == "safe" else 0.7,
+                "risk": item["risk"],
+                "items": [item["path"]],
+                "action_type": "delete",
+            })
+
+    # ── Dev Cleanup: Stale project artifacts ──
+    for proj in stale_projects:
+        if proj["reclaimable_bytes"] > 50 * 1024 * 1024:  # > 50 MB
+            artifact_names = ", ".join(d["name"] for d in proj["cleanable_dirs"][:3])
+            recs.append({
+                "id": f"stale_{hashlib.md5(proj['path'].encode()).hexdigest()[:8]}",
+                "title": f"Clean stale project: {proj['name']}",
+                "description": f"Not accessed in {proj['days_stale']} days. "
+                              f"Remove {artifact_names} to free {proj['reclaimable_formatted']}",
+                "category": "dev_cleanup",
+                "impact_bytes": proj["reclaimable_bytes"],
+                "impact_formatted": proj["reclaimable_formatted"],
+                "confidence": 0.85,
+                "risk": "safe",
+                "items": [d["path"] for d in proj["cleanable_dirs"]],
+                "action_type": "delete",
+                "project_path": proj["path"],
+                "days_stale": proj["days_stale"],
+            })
+
+    # ── Category Aggregates ──
+    # Group small items by category for batch recommendations
+    cat_groups = defaultdict(list)
+    for item in items:
+        if item["size"] < 500 * 1024 * 1024 and item["risk"] == "safe":
+            cat_groups[item.get("category", "other")].append(item)
+
+    category_labels = {
+        "browser_cache": "browser caches",
+        "dev_cache": "developer caches",
+        "app_cache": "application caches",
+        "system_logs": "system logs",
+        "general_cache": "general caches",
+    }
+
+    for cat_id, cat_items in cat_groups.items():
+        total = sum(i["size"] for i in cat_items)
+        if total > 100 * 1024 * 1024:  # > 100 MB combined
+            label = category_labels.get(cat_id, cat_id)
+            recs.append({
+                "id": f"batch_{cat_id}",
+                "title": f"Clear all {label}",
+                "description": f"{len(cat_items)} items totaling {format_size(total)}. "
+                              f"All marked as safe to delete.",
+                "category": "maintenance",
+                "impact_bytes": total,
+                "impact_formatted": format_size(total),
+                "confidence": 0.9,
+                "risk": "safe",
+                "items": [i["path"] for i in cat_items],
+                "action_type": "delete",
+            })
+
+    # ── Disk Space Warning ──
+    disk_free = disk_map.get("disk_free", 0)
+    disk_total = disk_map.get("disk_total", 1)
+    free_pct = (disk_free / disk_total * 100) if disk_total > 0 else 100
+
+    if free_pct < 10:
+        total_cleanable = sum(i["size"] for i in items if i["risk"] == "safe")
+        recs.insert(0, {
+            "id": "urgent_space",
+            "title": "⚠️ Disk space critically low",
+            "description": f"Only {format_size(disk_free)} free ({round(free_pct, 1)}%). "
+                          f"Clean safe items to reclaim {format_size(total_cleanable)}.",
+            "category": "urgent",
+            "impact_bytes": total_cleanable,
+            "impact_formatted": format_size(total_cleanable),
+            "confidence": 1.0,
+            "risk": "safe",
+            "items": [i["path"] for i in items if i["risk"] == "safe"],
+            "action_type": "delete",
+        })
+
+    # Sort by impact (largest first), with urgent at top
+    priority_order = {"urgent": 0, "quick_wins": 1, "dev_cleanup": 2, "maintenance": 3, "media_management": 4}
+    recs.sort(key=lambda r: (priority_order.get(r["category"], 5), -r["impact_bytes"]))
+
+    return recs
+
+
+# ─── Agent Intelligence: Storage Growth Timeline ────────────────────────────
+
+def get_storage_timeline(conn) -> list:
+    """Build storage growth timeline from historical scan data.
+    
+    Returns list of:
+      {"scan_time": str, "total_bytes": int, "total_formatted": str}
+    """
+    try:
+        rows = conn.execute(
+            "SELECT scan_time, total_bytes FROM scan_results ORDER BY id ASC"
+        ).fetchall()
+        return [
+            {
+                "scan_time": row[0],
+                "total_bytes": row[1],
+                "total_formatted": format_size(row[1]),
+            }
+            for row in rows
+        ]
+    except Exception:
+        return []
+
+
+def predict_space_exhaustion(timeline: list, disk_free: int) -> dict | None:
+    """Predict days until disk runs out of space based on growth trend.
+    
+    Returns: {"days_until_full": int, "growth_rate_bytes_per_day": int, ...} or None
+    """
+    if len(timeline) < 2:
+        return None
+
+    # Calculate growth rate from first and last scans
+    try:
+        first_time = datetime.fromisoformat(timeline[0]["scan_time"])
+        last_time = datetime.fromisoformat(timeline[-1]["scan_time"])
+        days_span = max((last_time - first_time).total_seconds() / 86400, 0.01)
+
+        first_bytes = timeline[0]["total_bytes"]
+        last_bytes = timeline[-1]["total_bytes"]
+        growth = last_bytes - first_bytes
+
+        if growth <= 0 or days_span < 0.1:
+            return None
+
+        rate_per_day = growth / days_span
+        days_until_full = disk_free / rate_per_day if rate_per_day > 0 else -1
+
+        return {
+            "days_until_full": round(days_until_full),
+            "growth_rate_bytes_per_day": round(rate_per_day),
+            "growth_rate_formatted": f"{format_size(round(rate_per_day))}/day",
+            "data_points": len(timeline),
+            "span_days": round(days_span, 1),
+        }
+    except (ValueError, TypeError):
+        return None
+
+
 # ─── SQLite Cache + Checkpointing ────────────────────────────────────────────
 
 def get_cache_db_path() -> str:
@@ -1655,6 +2089,9 @@ def run_scan():
     # ── Pass 3: Full Disk Map — complete picture ──
     disk_map = scan_full_disk(tracker)
 
+    # ── Pass 4: Agent Intelligence ──
+    stale_projects = detect_stale_projects(tracker)
+
     # ── Build completion payload ──
     duration = round(time.monotonic() - start_time, 2)
     total_bytes = sum(item["size"] for item in all_items)
@@ -1664,12 +2101,24 @@ def run_scan():
 
     # Build D3 metrics contract
     metrics = build_metrics(all_items, duration, tracker)
-    # Add disk-level info to metrics
     metrics["disk_total"] = disk_map["disk_total"]
     metrics["disk_used"] = disk_map["disk_used"]
     metrics["disk_free"] = disk_map["disk_free"]
     metrics["disk_mapped"] = disk_map["total_mapped"]
     metrics["hidden_space"] = disk_map["hidden_space"]
+
+    # Smart recommendations
+    recommendations = build_recommendations(all_items, disk_map, stale_projects)
+
+    # Storage timeline + prediction
+    timeline = []
+    prediction = None
+    if conn:
+        try:
+            timeline = get_storage_timeline(conn)
+            prediction = predict_space_exhaustion(timeline, disk_map.get("disk_free", 0))
+        except Exception:
+            pass
 
     # Sign scan results (attestation)
     try:
@@ -1703,7 +2152,7 @@ def run_scan():
                 "bytes": cat["bytes"],
                 "count": cat["count"],
                 "formatted": format_size(cat["bytes"]),
-                "dirs": cat["dirs"][:20],  # Top 20 per category for the event
+                "dirs": cat["dirs"][:20],
             }
             for cat_id, cat in disk_map["categories"].items()
             if cat["bytes"] > 0
@@ -1716,6 +2165,11 @@ def run_scan():
         "metrics": metrics,
         "attestation": attestation,
         "categories": metrics["categories"],
+        # Agent intelligence
+        "stale_projects": stale_projects,
+        "recommendations": recommendations,
+        "timeline": timeline,
+        "prediction": prediction,
     })
 
 
