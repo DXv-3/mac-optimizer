@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { HardDrive, Download, Play, Square, Trash2, RefreshCw, CheckCircle2, Shield, ShieldCheck, Zap, Clock, Eye, FolderOpen, MoreHorizontal } from 'lucide-react';
+import { HardDrive, Download, Play, Square, Trash2, RefreshCw, CheckCircle2, Shield, ShieldCheck, Zap, Clock, Eye, FolderOpen, MoreHorizontal, AlertTriangle, ExternalLink } from 'lucide-react';
 import useStore from '../../store/useStore';
 import SunburstChart from './SunburstChart';
 import TreemapChart from './TreemapChart';
@@ -10,6 +10,7 @@ import SearchBar from './SearchBar';
 import DeleteConfirmModal from './DeleteConfirmModal';
 import SkippedItemsPanel from './SkippedItemsPanel';
 import DeleteProgress from './DeleteProgress';
+import FDAGateModal from './FDAGateModal';
 
 const CATEGORY_LABELS = {
     browser_cache: { name: 'Browser', color: 'cyan' },
@@ -45,11 +46,16 @@ export default function StorageAnalyzer() {
         storageMetrics, storageAttestation, storageWarnings,
         storageRecommendations, storageStaleProjects, storagePrediction,
         storageSkippedItems, storageReconciliation,
-        storageDeleteProgress, storageDeleteLog,
+        storageDeleteProgress, storageDeleteLog, storageScanLog,
         startStorageScan, cancelStorageScan, setStorageSearch,
         setStorageFilter, setStorageSort, toggleStoragePath,
         selectAllStoragePaths, clearStorageSelection,
         deleteSelectedStoragePaths, exportStorageReport,
+        // FDA
+        fdaStatus, fdaDismissed, openFdaSettings,
+
+        // SWARM Tracking (Assuming these will be added to useStore.js next)
+        storageSwarmStatus, storageSwarmInsights
     } = useStore();
 
     const [showDeleteModal, setShowDeleteModal] = useState(false);
@@ -125,8 +131,15 @@ export default function StorageAnalyzer() {
             cats[cat].bytes += (item.sizeBytes || 0);
             cats[cat].count += 1;
         }
+        // Calculate total for percentage - cap at 100% to prevent "170% Disc Map" errors
+        const effectiveTotal = totalBytes > 0 ? totalBytes : 1;
         return Object.entries(cats)
-            .map(([id, data]) => ({ id, ...data, pct: totalBytes > 0 ? (data.bytes / totalBytes) * 100 : 0 }))
+            .map(([id, data]) => ({
+                id,
+                ...data,
+                // Cap percentage at 100% to prevent visualization overflow
+                pct: Math.min(100, (data.bytes / effectiveTotal) * 100)
+            }))
             .sort((a, b) => b.bytes - a.bytes);
     }, [storageItems, totalBytes]);
 
@@ -167,7 +180,9 @@ export default function StorageAnalyzer() {
     }, [safeItems, selectAllStoragePaths]);
 
     return (
-        <div className="h-full flex flex-col max-w-[1400px] mx-auto pb-6">
+        <div className="h-full flex flex-col max-w-[1400px] mx-auto pb-6 relative">
+            {/* FDA Gate Modal — absolute overlay, shown when storageState === 'fda_gate' */}
+            <FDAGateModal onScanReady={startStorageScan} />
             {/* Header */}
             <motion.div
                 initial={{ opacity: 0, y: -10 }}
@@ -206,9 +221,45 @@ export default function StorageAnalyzer() {
                 </div>
             </motion.div>
 
+            {/* Degraded Mode Banner — shown when FDA denied but user chose to scan anyway */}
+            <AnimatePresence>
+                {fdaStatus === 'denied' && fdaDismissed && storageState !== 'idle' && (
+                    <motion.div
+                        initial={{ opacity: 0, height: 0, marginBottom: 0 }}
+                        animate={{ opacity: 1, height: 'auto', marginBottom: '12px' }}
+                        exit={{ opacity: 0, height: 0, marginBottom: 0 }}
+                        transition={{ duration: 0.3 }}
+                        className="shrink-0 overflow-hidden"
+                    >
+                        <div
+                            className="flex items-center justify-between px-4 py-2.5 rounded-2xl"
+                            style={{
+                                background: 'rgba(245,158,11,0.07)',
+                                border: '1px solid rgba(245,158,11,0.18)',
+                            }}
+                        >
+                            <div className="flex items-center gap-2.5">
+                                <AlertTriangle size={14} className="text-amber-400 shrink-0" />
+                                <span className="text-xs text-amber-300/80">
+                                    <span className="font-semibold text-amber-300">Limited scan</span>
+                                    {' '}— protected folders like Mail and Safari were skipped.
+                                </span>
+                            </div>
+                            <button
+                                onClick={openFdaSettings}
+                                className="flex items-center gap-1.5 text-xs text-amber-400 hover:text-amber-300 transition-colors ml-4 shrink-0"
+                            >
+                                <ExternalLink size={11} />
+                                Grant Full Disk Access
+                            </button>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
             <AnimatePresence mode="wait">
-                {/* Idle State */}
-                {storageState === 'idle' && (
+                {/* Idle State — also shown during fda_gate so background content stays visible */}
+                {(storageState === 'idle' || storageState === 'fda_gate') && (
                     <motion.div
                         key="idle"
                         initial={{ opacity: 0, y: 20 }}
@@ -234,20 +285,52 @@ export default function StorageAnalyzer() {
                     </motion.div>
                 )}
 
-                {/* Scanning State */}
+                {/* Scanning / Swarm State */}
                 {storageState === 'scanning' && (
                     <motion.div
                         key="scanning"
                         initial={{ opacity: 0, scale: 0.98 }}
                         animate={{ opacity: 1, scale: 1 }}
                         exit={{ opacity: 0, scale: 0.98 }}
-                        className="flex-1 flex flex-col"
+                        className="flex-1 flex flex-col gap-4 overflow-hidden"
                     >
+                        {/* Swarm Intelligence Panel */}
+                        <div className="shrink-0 bg-white/[0.03] backdrop-blur-[20px] border border-cyan-500/20 rounded-[20px] p-5">
+                            <h3 className="text-sm font-semibold text-cyan-400 flex items-center gap-2 mb-4">
+                                <Zap size={16} /> Swarm Intelligence Network Active
+                            </h3>
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                                {storageSwarmStatus && Object.values(storageSwarmStatus).map(agent => (
+                                    <div key={agent.id} className="bg-white/[0.05] border border-white/[0.05] rounded-xl p-3 flex flex-col gap-2">
+                                        <div className="flex justify-between items-center">
+                                            <span className={`text-xs font-bold ${agent.type === 'explorer' ? 'text-blue-400' : 'text-purple-400'}`}>
+                                                {agent.id}
+                                            </span>
+                                            {agent.status.includes('Finished') || agent.status === 'Idle' ? (
+                                                <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_#10b981]" />
+                                            ) : (
+                                                <span className="w-2 h-2 rounded-full bg-cyan-500 animate-pulse shadow-[0_0_8px_#06b6d4]" />
+                                            )}
+                                        </div>
+                                        <div className="text-[10px] text-zinc-400 truncate opacity-80" title={agent.status}>
+                                            {agent.status}
+                                        </div>
+                                    </div>
+                                ))}
+                                {(!storageSwarmStatus || Object.keys(storageSwarmStatus).length === 0) && (
+                                    <div className="col-span-4 text-xs text-zinc-500 italic text-center py-2">
+                                        Deploying swarm agents...
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
                         <ScanProgress
                             progress={storageScanProgress}
                             items={storageItems}
                             categories={storageCategories}
                             warnings={storageWarnings}
+                            log={storageScanLog}
                         />
                     </motion.div>
                 )}
@@ -378,31 +461,57 @@ export default function StorageAnalyzer() {
                                                 {formatSize(storageDiskUsed)} used / {formatSize(storageDiskTotal)} total
                                             </span>
                                         </div>
-                                        <div className="h-3 rounded-full overflow-hidden bg-white/[0.04] flex">
-                                            <div
-                                                className="bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-700"
-                                                style={{ width: `${Math.max(0, ((storageDiskUsed - totalBytes) / storageDiskTotal) * 100)}%` }}
-                                                title={`Used: ${formatSize(storageDiskUsed - totalBytes)}`}
-                                            />
-                                            <div
-                                                className="bg-gradient-to-r from-amber-500 to-orange-400 transition-all duration-700"
-                                                style={{ width: `${(totalBytes / storageDiskTotal) * 100}%` }}
-                                                title={`Cleanable: ${formatSize(totalBytes)}`}
-                                            />
+                                        {/* Calculate percentages with caps to prevent overflow */}
+                                        {(() => {
+                                            const usedPct = Math.min(100, Math.max(0, ((storageDiskUsed - totalBytes) / storageDiskTotal) * 100));
+                                            const cleanablePct = Math.min(100 - usedPct, Math.max(0, (totalBytes / storageDiskTotal) * 100));
+                                            const freePct = Math.min(100, Math.max(0, (storageDiskFree / storageDiskTotal) * 100));
+                                            return (
+                                                <>
+                                                    <div className="h-3 rounded-full overflow-hidden bg-white/[0.04] flex">
+                                                        <div
+                                                            className="bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-700"
+                                                            style={{ width: `${usedPct}%` }}
+                                                            title={`Used: ${formatSize(storageDiskUsed - totalBytes)}`}
+                                                        />
+                                                        <div
+                                                            className="bg-gradient-to-r from-amber-500 to-orange-400 transition-all duration-700"
+                                                            style={{ width: `${cleanablePct}%` }}
+                                                            title={`Cleanable: ${formatSize(totalBytes)}`}
+                                                        />
+                                                    </div>
+                                                    <div className="flex items-center gap-4 mt-1.5 text-[10px] text-zinc-500">
+                                                        <span className="flex items-center gap-1">
+                                                            <span className="w-2 h-2 rounded-full bg-blue-500" />
+                                                            Used ({formatSize(storageDiskUsed - totalBytes)})
+                                                        </span>
+                                                        <span className="flex items-center gap-1">
+                                                            <span className="w-2 h-2 rounded-full bg-amber-500" />
+                                                            Cleanable ({formatSize(totalBytes)})
+                                                        </span>
+                                                        <span className="flex items-center gap-1">
+                                                            <span className="w-2 h-2 rounded-full bg-white/[0.1]" />
+                                                            Free ({formatSize(storageDiskFree)})
+                                                        </span>
+                                                    </div>
+                                                </>
+                                            );
+                                        })()}
+                                    </div>
+                                )}
+
+                                {/* Reconciliation Info - Shows unmapped bytes (400GB discrepancy) */}
+                                {storageReconciliation && storageReconciliation.unmapped_bytes > 0 && (
+                                    <div className="mb-3 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
+                                        <div className="flex items-center gap-2 text-[10px]">
+                                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
+                                            <span className="text-amber-400 font-medium">Unmapped Space:</span>
+                                            <span className="text-amber-300">
+                                                {storageReconciliation.unmapped_formatted} ({storageReconciliation.discrepancy_pct}%) not categorized
+                                            </span>
                                         </div>
-                                        <div className="flex items-center gap-4 mt-1.5 text-[10px] text-zinc-500">
-                                            <span className="flex items-center gap-1">
-                                                <span className="w-2 h-2 rounded-full bg-blue-500" />
-                                                Used ({formatSize(storageDiskUsed - totalBytes)})
-                                            </span>
-                                            <span className="flex items-center gap-1">
-                                                <span className="w-2 h-2 rounded-full bg-amber-500" />
-                                                Cleanable ({formatSize(totalBytes)})
-                                            </span>
-                                            <span className="flex items-center gap-1">
-                                                <span className="w-2 h-2 rounded-full bg-white/[0.1]" />
-                                                Free ({formatSize(storageDiskFree)})
-                                            </span>
+                                        <div className="text-[9px] text-zinc-500 mt-1 ml-3.5">
+                                            This includes system files, APFS snapshots, and permission-protected directories
                                         </div>
                                     </div>
                                 )}
@@ -526,6 +635,28 @@ export default function StorageAnalyzer() {
                                     </div>
                                 )}
 
+                                {/* Swarm Deep Insights (Duplicates, Large Media, etc.) */}
+                                {storageSwarmInsights && storageSwarmInsights.length > 0 && (
+                                    <div className="mb-3">
+                                        <div className="text-[10px] uppercase tracking-wider text-purple-400 mb-1.5 flex items-center gap-1.5">
+                                            <Shield size={10} /> Deep Analysis Alerts
+                                        </div>
+                                        <div className="space-y-1">
+                                            {storageSwarmInsights.map((insight, idx) => (
+                                                <div key={idx} className="flex items-center justify-between p-2 rounded-lg bg-purple-500/10 border border-purple-500/20 hover:bg-purple-500/20 transition-colors">
+                                                    <div className="flex items-center gap-2 min-w-0">
+                                                        <span className="w-1.5 h-1.5 rounded-full bg-purple-400 shrink-0" />
+                                                        <span className="text-xs text-purple-100 truncate">{insight.project_name || insight.message}</span>
+                                                    </div>
+                                                    <span className="text-[10px] font-mono text-purple-300 shrink-0">
+                                                        {insight.reclaimable_formatted}
+                                                    </span>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
+
                                 {/* Stale Projects */}
                                 {storageStaleProjects.length > 0 && (
                                     <div className="mb-3">
@@ -643,13 +774,15 @@ export default function StorageAnalyzer() {
                 )}
             </AnimatePresence>
 
-            {/* Delete Progress */}
+            {/* Delete Progress - Centered Modal */}
             {(storageDeleteProgress || storageDeleteLog.length > 0) && (
-                <div className="fixed bottom-6 right-6 z-50 w-[500px] max-w-[90vw]">
-                    <DeleteProgress
-                        progress={storageDeleteProgress}
-                        log={storageDeleteLog}
-                    />
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
+                    <div className="w-[550px] max-w-[95vw] max-h-[80vh] overflow-hidden">
+                        <DeleteProgress
+                            progress={storageDeleteProgress}
+                            log={storageDeleteLog}
+                        />
+                    </div>
                 </div>
             )}
 

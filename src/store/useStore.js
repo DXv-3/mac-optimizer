@@ -8,6 +8,14 @@ function formatBytes(bytes) {
     return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 2 : 0)} ${units[i]}`;
 }
 
+const checkIpc = (set) => {
+    if (!window.ipcRenderer) {
+        set({ error: "Electron IPC missing. Please run the app via Electron, not a web browser (e.g. run 'npm run dev')." });
+        return false;
+    }
+    return true;
+};
+
 // Build a tree structure for sunburst visualization
 function buildStorageTree(items) {
     const root = { name: 'Storage', children: [] };
@@ -64,12 +72,49 @@ const useStore = create((set, get) => ({
         appsCount: 0
     },
 
+    // ── Full Disk Access (FDA) Permission State ──────────────────────────────
+    // fdaStatus: null = not yet checked, 'granted', 'denied', 'unknown'
+    fdaStatus: null,
+    fdaChecking: false,
+    fdaDismissed: false, // user clicked "Scan Without Full Access"
+
     // Computed errors
     error: null,
     setError: (error) => set({ error }),
 
+    // ── FDA Actions ───────────────────────────────────────────────────────────
+    checkFdaStatus: async () => {
+        if (!window.electronAPI?.checkFdaStatus) return { granted: true, confidence: 'low' };
+        set({ fdaChecking: true });
+        try {
+            const result = await window.electronAPI.checkFdaStatus();
+            set({
+                fdaStatus: result.granted ? 'granted' : 'denied',
+                fdaChecking: false,
+            });
+            return result;
+        } catch (err) {
+            set({ fdaStatus: 'unknown', fdaChecking: false });
+            return { granted: true, confidence: 'low' };
+        }
+    },
+
+    openFdaSettings: async () => {
+        if (!window.electronAPI?.openFdaSettings) return;
+        try {
+            await window.electronAPI.openFdaSettings();
+        } catch (err) {
+            console.error('[FDA] Failed to open System Settings:', err);
+        }
+    },
+
+    dismissFdaWarning: () => set({ fdaDismissed: true }),
+
+    resetFda: () => set({ fdaStatus: null, fdaChecking: false, fdaDismissed: false }),
+
     // Orchestrated Smart Scan
     runSmartScan: async () => {
+        if (!checkIpc(set)) return;
         set({ scanState: 'scanning', error: null });
 
         try {
@@ -99,6 +144,7 @@ const useStore = create((set, get) => ({
 
     // Manual Trigger for Cleanup Scan
     scanCleanup: async () => {
+        if (!checkIpc(set)) return;
         set({ isScanningCleanup: true, error: null });
         try {
             const data = await window.ipcRenderer.invoke('scan-system-junk');
@@ -113,6 +159,7 @@ const useStore = create((set, get) => ({
 
     // Manual Trigger for Apps Scan
     scanApps: async () => {
+        if (!checkIpc(set)) return;
         set({ isScanningApps: true, error: null });
         try {
             const data = await window.ipcRenderer.invoke('scan-app-telemetry');
@@ -127,6 +174,7 @@ const useStore = create((set, get) => ({
 
     // Execute Cleanup Shell Script
     executeCleanup: async (targetPaths) => {
+        if (!checkIpc(set)) return;
         set({ isCleaning: true, error: null });
         try {
             const response = await window.ipcRenderer.invoke('execute-cleanup', targetPaths);
@@ -160,6 +208,8 @@ const useStore = create((set, get) => ({
     storageWarnings: [],
     storageRecommendations: [],
     storageStaleProjects: [],
+    storageSwarmStatus: {},
+    storageSwarmInsights: [],
     storageTimeline: [],
     storagePrediction: null,
     storageSkippedItems: [],
@@ -172,8 +222,45 @@ const useStore = create((set, get) => ({
     storageSelectedPaths: new Set(),
     _storageListenerCleanup: null,
 
-    startStorageScan: () => {
-        // Reset state
+    startStorageScan: async () => {
+        if (!checkIpc(set)) return;
+
+        // ── FDA Gate ──────────────────────────────────────────────────────────
+        // Check FDA status before launching the Python scanner.
+        // If denied and the user hasn't dismissed the warning, set a pending
+        // state that FDAGateModal will detect and display. Scan does NOT start
+        // until user resolves the modal.
+        const { fdaStatus, fdaDismissed } = get();
+        const needsCheck = !fdaStatus || fdaStatus === null;
+        if (needsCheck || fdaStatus === 'denied') {
+            if (needsCheck) {
+                // Run probe now (first time, or after reset)
+                set({ fdaChecking: true });
+                try {
+                    const result = window.electronAPI?.checkFdaStatus
+                        ? await window.electronAPI.checkFdaStatus()
+                        : { granted: true, confidence: 'low' };
+                    set({
+                        fdaStatus: result.granted ? 'granted' : 'denied',
+                        fdaChecking: false,
+                    });
+                    // If denied and user hasn't dismissed, abort — let modal handle it
+                    if (!result.granted && !fdaDismissed) {
+                        // storageState stays 'idle' — FDAGateModal is shown by StorageAnalyzer
+                        set({ storageState: 'fda_gate' });
+                        return;
+                    }
+                } catch (_) {
+                    set({ fdaStatus: 'unknown', fdaChecking: false });
+                }
+            } else if (fdaStatus === 'denied' && !fdaDismissed) {
+                // Already know it's denied and user hasn't dismissed
+                set({ storageState: 'fda_gate' });
+                return;
+            }
+        }
+
+        // Reset all state
         set({
             storageState: 'scanning',
             storageScanProgress: null,
@@ -190,6 +277,8 @@ const useStore = create((set, get) => ({
             storageWarnings: [],
             storageRecommendations: [],
             storageStaleProjects: [],
+            storageSwarmStatus: {},
+            storageSwarmInsights: [],
             storageTimeline: [],
             storagePrediction: null,
             storageSkippedItems: [],
@@ -199,66 +288,46 @@ const useStore = create((set, get) => ({
             error: null,
         });
 
-        // Set up IPC listener for streaming events
-        const cleanup = get()._storageListenerCleanup;
-        if (cleanup) cleanup();
+        if (!checkIpc(set)) {
+            set({ storageState: 'idle' });
+            return;
+        }
 
-        const handler = (_event, data) => {
-            const state = get();
-            // Handle both 'type' and 'event' fields for compatibility
-            const eventType = data.type || data.event;
+        // Clean up any previous listener
+        const prevCleanup = get()._storageListenerCleanup;
+        if (prevCleanup) prevCleanup();
 
-            switch (eventType) {
-                case 'start':
-                    // Scan started
-                    break;
-                case 'progress':
-                    set({
-                        storageScanProgress: {
-                            phase: data.phase,
-                            currentPath: data.current_path,
-                            filesProcessed: data.files_processed,
-                            bytesScanned: data.bytes_scanned,
-                            scanRateMbps: data.scan_rate_mbps,
-                            etaSeconds: data.eta_seconds,
-                            elapsed: data.elapsed || 0,
-                            errorCount: data.error_count,
-                            errors: data.errors || {},
-                            lastError: data.last_error,
-                        }
-                    });
-                    break;
-                case 'warning':
-                    set({ storageWarnings: [...state.storageWarnings, data] });
-                    break;
-                case 'item':
-                    // Add item with proper field mapping
-                    set({
-                        storageItems: [...state.storageItems, {
-                            id: data.id || data.path,
-                            name: data.name,
-                            path: data.path,
-                            category: data.category,
-                            description: data.description,
-                            size: data.sizeBytes,
-                            sizeBytes: data.sizeBytes,
-                            sizeFormatted: data.sizeFormatted || data.size_formatted,
-                            fileCount: data.fileCount || data.file_count,
-                            lastUsed: data.lastUsed || data.last_used,
-                            daysSinceUsed: data.daysSinceUsed || data.days_since_used,
-                            risk: data.risk,
-                            confidence: data.confidence,
-                            recoveryNote: data.recoveryNote || data.recovery_note,
-                        }]
-                    });
-                    break;
-                case 'found':
-                    set({ storageCategories: [...state.storageCategories, data] });
-                    break;
-                case 'complete':
-                    // Normalize every item: guarantee size, sizeBytes, sizeFormatted all exist
-                    const rawItems = data.items || state.storageItems;
-                    const normalizedItems = rawItems.map(item => {
+        // Track current scanId to discard stale events from cancelled scans
+        let activeScanId = null;
+
+        const handler = (_event, snapshot) => {
+            // ── Snapshot format (new) ──────────────────────────────────────
+            if (snapshot && snapshot.type === 'snapshot') {
+                const { scanId, status, progress, addedItems, totals, complete, warnings, error, agentStatusUpdates, newInsights } = snapshot;
+
+                // Bind scanId on first event
+                if (!activeScanId) activeScanId = scanId;
+                // Discard events from a different (stale) scan
+                if (scanId !== activeScanId) return;
+
+                // Build one Zustand update object — ONE re-render per tick
+                const update = {};
+
+                if (progress) {
+                    update.storageScanProgress = {
+                        phase: progress.phase,
+                        currentPath: progress.dir,
+                        filesProcessed: progress.files || 0,
+                        bytesScanned: progress.bytes || 0,
+                        scanRateMbps: progress.rate_mbps || 0,
+                        etaSeconds: progress.eta_seconds ?? -1,
+                        elapsed: progress.elapsed || 0,
+                    };
+                }
+
+                // Append items in O(items) — not O(total) — with single spread
+                if (addedItems && addedItems.length > 0) {
+                    const normalized = addedItems.map(item => {
                         const bytes = item.sizeBytes || item.size || 0;
                         return {
                             id: item.id || item.path,
@@ -266,7 +335,6 @@ const useStore = create((set, get) => ({
                             path: item.path,
                             category: item.category,
                             description: item.description,
-                            // Math-critical: always set BOTH size and sizeBytes to the same integer
                             size: bytes,
                             sizeBytes: bytes,
                             sizeFormatted: item.sizeFormatted || item.size_formatted || formatBytes(bytes),
@@ -278,32 +346,125 @@ const useStore = create((set, get) => ({
                             recoveryNote: item.recoveryNote || item.recovery_note,
                         };
                     });
-                    const tree = buildStorageTree(normalizedItems);
-                    const categories = [...new Set(normalizedItems.map(i => i.category))];
+                    const currentItems = get().storageItems;
+                    update.storageItems = [...currentItems, ...normalized];
+                    // Update category list without O(n) rebuild every tick
+                    const catSet = new Set(get().storageCategories);
+                    normalized.forEach(i => i.category && catSet.add(i.category));
+                    update.storageCategories = Array.from(catSet);
+                }
 
+                // Totals come from backend — never recompute in frontend
+                if (totals) {
+                    if (totals.disk_total != null) update.storageDiskTotal = totals.disk_total;
+                    if (totals.disk_used != null) update.storageDiskUsed = totals.disk_used;
+                    if (totals.disk_free != null) update.storageDiskFree = totals.disk_free;
+                }
+
+                // Cap warnings and log at 100 entries (FIFO)
+                if (warnings && warnings.length > 0) {
+                    const prev = get().storageWarnings;
+                    update.storageWarnings = [...prev, ...warnings].slice(-100);
+                }
+
+                if (agentStatusUpdates && agentStatusUpdates.length > 0) {
+                    const prevStatus = get().storageSwarmStatus || {};
+                    const newStatus = { ...prevStatus };
+                    for (const agent of agentStatusUpdates) {
+                        newStatus[agent.agent_id] = {
+                            id: agent.agent_id,
+                            status: agent.status,
+                            type: agent.type
+                        };
+                    }
+                    update.storageSwarmStatus = newStatus;
+                }
+
+                if (newInsights && newInsights.length > 0) {
+                    const prevInsights = get().storageSwarmInsights || [];
+                    update.storageSwarmInsights = [...prevInsights, ...newInsights];
+                }
+
+                if (status === 'done' && complete) {
+                    const rawItems = complete.items || get().storageItems;
+                    const normalizedAll = rawItems.map(item => {
+                        const bytes = item.sizeBytes || item.size || 0;
+                        return {
+                            id: item.id || item.path, name: item.name, path: item.path,
+                            category: item.category, description: item.description,
+                            size: bytes, sizeBytes: bytes,
+                            sizeFormatted: item.sizeFormatted || item.size_formatted || formatBytes(bytes),
+                            fileCount: item.fileCount || item.file_count || 0,
+                            lastUsed: item.lastUsed || item.last_used || item.last_accessed || 'Unknown',
+                            daysSinceUsed: item.daysSinceUsed || item.days_since_used || 99999,
+                            risk: item.risk || 'caution',
+                            confidence: item.confidence,
+                            recoveryNote: item.recoveryNote || item.recovery_note,
+                        };
+                    });
+                    update.storageState = 'complete';
+                    update.storageItems = normalizedAll;
+                    update.storageTree = buildStorageTree(normalizedAll);
+                    update.storageCategories = [...new Set(normalizedAll.map(i => i.category))];
+                    update.storageFullTree = complete.full_tree || null;
+                    update.storageDiskMap = complete.disk_map || null;
+                    update.storageDiskTotal = complete.disk_total || totals?.disk_total || 0;
+                    update.storageDiskUsed = complete.disk_used || totals?.disk_used || 0;
+                    update.storageDiskFree = complete.disk_free || totals?.disk_free || 0;
+                    update.storageMetrics = complete.metrics || null;
+                    update.storageAttestation = complete.attestation || null;
+                    update.storageRecommendations = complete.recommendations || [];
+                    update.storageStaleProjects = complete.stale_projects || [];
+                    update.storageTimeline = complete.timeline || [];
+                    update.storagePrediction = complete.prediction || null;
+                    update.storageSkippedItems = complete.skipped_items || [];
+                    update.storageReconciliation = complete.reconciliation || null;
+                    update.storageScanProgress = null;
+                    activeScanId = null;
+                }
+
+                if (status === 'error' && error) {
+                    update.error = error.message;
+                    update.storageState = 'idle';
+                    activeScanId = null;
+                }
+
+                if (status === 'cancelled') {
+                    update.storageState = 'idle';
+                    update.storageScanProgress = null;
+                    activeScanId = null;
+                }
+
+                // ── ONE set() call = ONE React re-render ──────────────────
+                set(update);
+                return;
+            }
+
+            // ── Legacy passthrough format (fallback) ──────────────────────
+            const state = get();
+            const eventType = snapshot.type || snapshot.event;
+
+            switch (eventType) {
+                case 'progress':
                     set({
-                        storageState: 'complete',
-                        storageTree: tree,
-                        storageFullTree: data.full_tree || null,
-                        storageDiskMap: data.disk_map || null,
-                        storageDiskTotal: data.disk_total || 0,
-                        storageDiskUsed: data.disk_used || 0,
-                        storageDiskFree: data.disk_free || 0,
-                        storageItems: normalizedItems,
-                        storageCategories: categories,
-                        storageMetrics: data.metrics || null,
-                        storageAttestation: data.attestation || null,
-                        storageRecommendations: data.recommendations || [],
-                        storageStaleProjects: data.stale_projects || [],
-                        storageTimeline: data.timeline || [],
-                        storagePrediction: data.prediction || null,
-                        storageSkippedItems: data.skipped_items || [],
-                        storageReconciliation: data.reconciliation || null,
-                        storageScanProgress: null,
+                        storageScanProgress: {
+                            phase: snapshot.phase, currentPath: snapshot.current_path,
+                            filesProcessed: snapshot.files_processed, bytesScanned: snapshot.bytes_scanned,
+                            scanRateMbps: snapshot.scan_rate_mbps, etaSeconds: snapshot.eta_seconds,
+                            elapsed: snapshot.elapsed || 0,
+                        }
                     });
                     break;
+                case 'batch':
+                    if (Array.isArray(snapshot.items)) {
+                        set({ storageItems: [...state.storageItems, ...snapshot.items] });
+                    }
+                    break;
+                case 'item':
+                    set({ storageItems: [...state.storageItems, snapshot] });
+                    break;
                 case 'error':
-                    set({ error: data.message, storageState: 'idle' });
+                    set({ error: snapshot.message, storageState: 'idle' });
                     break;
             }
         };
@@ -315,11 +476,11 @@ const useStore = create((set, get) => ({
             }
         });
 
-        // Tell main process to start the scan
         window.ipcRenderer.send('start-storage-scan');
     },
 
     cancelStorageScan: () => {
+        if (!window.ipcRenderer) return;
         window.ipcRenderer.send('cancel-storage-scan');
         const cleanup = get()._storageListenerCleanup;
         if (cleanup) cleanup();
@@ -353,6 +514,7 @@ const useStore = create((set, get) => ({
     storageDeleteLog: [],
 
     deleteSelectedStoragePaths: async () => {
+        if (!checkIpc(set)) return;
         const paths = Array.from(get().storageSelectedPaths);
         if (paths.length === 0) return;
 
@@ -413,6 +575,7 @@ const useStore = create((set, get) => ({
     },
 
     exportStorageReport: async () => {
+        if (!checkIpc(set)) return;
         try {
             const reportData = {
                 items: get().storageItems,
@@ -426,6 +589,12 @@ const useStore = create((set, get) => ({
             set({ error: err.message });
         }
     },
+    closeDeleteProgressModal: () => {
+        set({
+            storageDeleteProgress: null,
+            storageDeleteLog: []
+        });
+    }
 }));
 
 export default useStore;
