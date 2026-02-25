@@ -2,11 +2,14 @@
     "name": "mac-optimizer",
     "private": true,
     "version": "1.0.0",
+    "type": "module",
     "scripts": {
-        "dev": "concurrently -k \"vite\" \"npm run electron:dev\"",
+        "dev": "npm run preflight && concurrently -k \"vite\" \"npm run electron:dev\"",
         "electron:dev": "wait-on http://localhost:5173 && ./run-electron.sh",
-        "build": "vite build && electron-builder",
-        "preview": "vite preview"
+        "build": "npm run preflight && vite build && electron-builder",
+        "preview": "vite preview",
+        "fix": "sudo ./fix-permissions.sh",
+        "preflight": "node -e \"const f=require('fs'),p='node_modules';if(f.existsSync(p)){try{f.realpathSync(p)}catch(e){console.error('\\u274c EPERM detected! Run: npm run fix');process.exit(1)}}console.log('\\u2705 Permissions OK')\""
     },
     "dependencies": {
         "clsx": "^2.1.1",

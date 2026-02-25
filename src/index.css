@@ -2,13 +2,146 @@
 @tailwind components;
 @tailwind utilities;
 
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * macOS SF Pro Typography & Base Reset
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+:root {
+  --apple-system: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'SF Pro Display', 'Helvetica Neue', sans-serif;
+  --apple-blue: #007AFF;
+  --apple-green: #34C759;
+  --apple-red: #FF3B30;
+  --glass-sidebar: rgba(15, 5, 24, 0.6);
+  --glass-panel: rgba(255, 255, 255, 0.05);
+  --glass-border: rgba(255, 255, 255, 0.08);
+}
+
 @layer base {
+
+  html,
+  body,
+  #root {
+    height: 100%;
+    width: 100%;
+  }
+
   body {
+    font-family: var(--apple-system);
     -webkit-font-smoothing: antialiased;
-    justify-content: center;
-    align-items: center;
-    display: flex;
+    -moz-osx-font-smoothing: grayscale;
+    background: transparent;
     overflow: hidden;
     user-select: none;
   }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * Custom Webkit Scrollbars — macOS Native Look
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+  min-height: 32px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.25);
+}
+
+::-webkit-scrollbar-corner {
+  background: transparent;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * Glassmorphism Utility Classes
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+.glass-panel {
+  background: var(--glass-panel);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid var(--glass-border);
+}
+
+.glass-card {
+  background: rgba(255, 255, 255, 0.06);
+  backdrop-filter: blur(12px);
+  -webkit-backdrop-filter: blur(12px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  transition: background 0.2s ease, transform 0.2s ease;
+}
+
+.glass-card:hover {
+  background: rgba(255, 255, 255, 0.09);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * Scanning Radar Animation
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+@keyframes radar-sweep {
+  from {
+    transform: rotate(0deg);
+  }
+
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+@keyframes pulse-ring {
+
+  0%,
+  100% {
+    transform: scale(0.8);
+    opacity: 0.4;
+  }
+
+  50% {
+    transform: scale(1.2);
+    opacity: 1;
+  }
+}
+
+@keyframes float {
+
+  0%,
+  100% {
+    transform: translateY(0px);
+  }
+
+  50% {
+    transform: translateY(-8px);
+  }
+}
+
+@keyframes shimmer {
+  from {
+    background-position: -200% center;
+  }
+
+  to {
+    background-position: 200% center;
+  }
+}
+
+.animate-float {
+  animation: float 3s ease-in-out infinite;
+}
+
+.animate-shimmer {
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.1), transparent);
+  background-size: 200% auto;
+  animation: shimmer 2s linear infinite;
 }

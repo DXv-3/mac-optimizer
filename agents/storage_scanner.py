@@ -26,33 +26,41 @@ Error Handling Contract:
   BrokenPipeError  → exit cleanly (parent process closed)
   Any other OSError→ log full exception, skip item, continue
 """
-
 import argparse
-import hashlib
+import macos_intelligence
 import json
 import math
 import os
 import shutil
-import stat
-import struct
 import subprocess
 import sys
 import time
 import sqlite3
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from pathlib import Path
+from threading import Lock
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
 HOME = os.path.expanduser("~")
 LIBRARY = os.path.join(HOME, "Library")
 APP_SUPPORT = os.path.join(LIBRARY, "Application Support", "MacOptimizer")
-EMIT_INTERVAL = 0.1  # seconds between progress events
-MIN_ITEM_SIZE = 1024  # 1 KB minimum to report
+EMIT_INTERVAL = 0.2        # seconds between progress events (was 0.1 — too chatty)
+MIN_ITEM_SIZE = 1024       # 1 KB minimum to report
 DISK_WARN_THRESHOLD = 1 * 1024 * 1024 * 1024  # 1 GB
 DISK_CHECK_INTERVAL = 100  # check every N items
-ENTROPY_BINARY_THRESHOLD = 0.30  # >30% non-printable bytes = binary
+
+# ─── Buffered Emit ──────────────────────────────────────────────────────────
+# Instead of flushing stdout for every single item (which blocks Python and
+# hammers the Electron readline parser), we buffer item events and flush them
+# in batches.  Progress/found/complete/error events still flush immediately.
+
+_emit_lock = Lock()
+_item_buffer: list = []
+_last_item_flush: float = 0.0
+_ITEM_FLUSH_INTERVAL = 0.15  # flush buffered items every 150ms
 
 # ─── Extension Allowlist (file-type targeting) ───────────────────────────────
 
@@ -153,17 +161,53 @@ def classify_risk(path: str) -> str:
 
 # ─── Utility Functions ──────────────────────────────────────────────────────
 
-def emit(event_dict: dict):
-    """Write a JSON event line to stdout and flush immediately."""
+def _flush_item_buffer(force: bool = False):
+    """Flush buffered item events to stdout as a single batch line."""
+    global _item_buffer, _last_item_flush
+    now = time.monotonic()
+    if not _item_buffer:
+        return
+    if not force and (now - _last_item_flush) < _ITEM_FLUSH_INTERVAL:
+        return
+    with _emit_lock:
+        if not _item_buffer:
+            return
+        batch = _item_buffer[:]
+        _item_buffer = []
+        _last_item_flush = now
     try:
-        # Auto-add camelCase aliases for item events (frontend compatibility)
-        if event_dict.get("event") == "item":
+        # Emit a single 'batch' event containing multiple items — one stdout write
+        sys.stdout.write(json.dumps({"event": "batch", "items": batch}) + "\n")
+        sys.stdout.flush()
+    except BrokenPipeError:
+        sys.exit(0)
+
+
+def emit(event_dict: dict):
+    """Write a JSON event line to stdout.
+
+    Item events are buffered and flushed in batches every 150ms to avoid
+    hammering the Electron readline parser with thousands of tiny writes.
+    All other events (progress, found, complete, warning, error) flush immediately.
+    """
+    global _item_buffer, _last_item_flush
+    try:
+        evt = event_dict.get("event")
+        # Normalize camelCase aliases for frontend compatibility
+        if evt == "item":
             if "size" in event_dict and "sizeBytes" not in event_dict:
                 event_dict["sizeBytes"] = event_dict["size"]
             if "size_formatted" in event_dict and "sizeFormatted" not in event_dict:
                 event_dict["sizeFormatted"] = event_dict["size_formatted"]
             if "last_accessed" in event_dict and "lastUsed" not in event_dict:
                 event_dict["lastUsed"] = event_dict["last_accessed"]
+            # Buffer instead of immediate flush
+            with _emit_lock:
+                _item_buffer.append(event_dict)
+            _flush_item_buffer()  # will no-op if interval not met
+            return
+        # Non-item events: flush pending items first, then emit immediately
+        _flush_item_buffer(force=True)
         sys.stdout.write(json.dumps(event_dict) + "\n")
         sys.stdout.flush()
     except BrokenPipeError:
@@ -230,21 +274,61 @@ def retry_fs_op(fn, max_retries=3, initial_delay=0.1, max_delay=5.0):
     raise last_err
 
 
-def get_dir_size_fast(path: str) -> int:
-    """Calculate directory size, skipping symlinks."""
+# Bundle/virtual-FS types that should be measured as a single blob without deep recursion
+_DU_ONLY_SUFFIXES = ('.photoslibrary', '.dv')
+_DU_ONLY_PATH_MARKERS = ('/Library/CloudStorage/',)  # Google Drive, iCloud Drive virtual mounts
+
+
+def _is_du_only_path(path: str) -> bool:
+    """Return True if this path should be measured as a single blob (no deep recursion)."""
+    if any(path.endswith(s) for s in _DU_ONLY_SUFFIXES):
+        return True
+    if any(m in path for m in _DU_ONLY_PATH_MARKERS):
+        return True
+    return False
+
+
+def _scandir_size(path: str) -> int:
+    """Recursively sum file sizes using os.scandir with DirEntry.stat() caching.
+
+    DirEntry.stat() re-uses the inode info the kernel already returned from
+    the getdents() syscall, so on APFS we avoid a separate stat() call per
+    entry entirely.  This is significantly faster than os.walk + os.lstat.
+
+    Rules:
+    - followlinks=False  — no symlink traversal
+    - Skips symlinks (st_size of the symlink itself, not the target)
+    - PermissionError / OSError on individual entries are skipped silently
+    """
     total = 0
-    try:
-        for dirpath, dirnames, filenames in os.walk(path, followlinks=False):
-            for f in filenames:
-                fp = os.path.join(dirpath, f)
-                if not os.path.islink(fp):
+    stack = [path]
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
                     try:
-                        total += os.path.getsize(fp)
-                    except (OSError, FileNotFoundError):
+                        if entry.is_symlink():
+                            continue  # skip symlinks
+                        st = entry.stat(follow_symlinks=False)
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(entry.path)  # recurse
+                        else:
+                            total += st.st_size
+                    except OSError:
                         pass
-    except (PermissionError, OSError):
-        pass
+        except (PermissionError, OSError):
+            pass
     return total
+
+
+def get_dir_size_fast(path: str) -> int:
+    """Calculate directory size — pure Python, no subprocess, no FSEvents.
+
+    Uses scandir-based recursive walk (faster than os.walk on APFS because
+    DirEntry.stat() is cached from the directory read syscall).
+    """
+    return _scandir_size(path)
 
 
 def dir_exists(path: str) -> bool:
@@ -1128,17 +1212,19 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
             "bytes": 0,
             "children": [],
             "file_count": 0,
+            "locked": False,
         }
 
         try:
             entries = list(os.scandir(dir_path))
         except (PermissionError, OSError) as e:
             tracker.record_error(dir_path, e)
-            # Try to at least get the total size
+            # Still show this node — try du -sk for best-effort size
             try:
                 node["bytes"] = get_dir_size_fast(dir_path)
             except OSError:
                 pass
+            node["locked"] = True
             return node
 
         child_dirs = []
@@ -1164,37 +1250,72 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
                     loose_file_count += 1
 
                 elif entry.is_dir(follow_symlinks=False):
+                    if _is_du_only_path(entry.path):
+                        # Measure without recursing into virtual/bundle filesystems.
+                        # Use pure Python get_dir_size_fast — no subprocess spawning.
+                        try:
+                            csize = get_dir_size_fast(entry.path)
+                            node["children"].append({
+                                "name": entry.name,
+                                "path": entry.path,
+                                "bytes": csize,
+                                "children": [],
+                                "file_count": 0,
+                            })
+                            node["bytes"] += csize
+                        except Exception:
+                            pass
+                        continue
                     child_dirs.append(entry)
 
             except (PermissionError, OSError) as e:
                 tracker.record_error(entry.path, e)
+                # Still add the entry to the tree as a locked node
+                try:
+                    locked_size = 0
+                    try:
+                        locked_size = get_dir_size_fast(entry.path)
+                    except Exception:
+                        pass
+                    node["children"].append({
+                        "name": entry.name,
+                        "path": entry.path,
+                        "bytes": locked_size,
+                        "children": [],
+                        "file_count": 0,
+                        "locked": True,
+                    })
+                    node["bytes"] += locked_size
+                except Exception:
+                    pass
                 continue
 
-        # Recurse into child directories
+        # Recurse into child directories — always add every node, even locked/empty ones
         if current_depth < max_depth:
             for child_entry in child_dirs:
                 tracker.update(child_entry.path, files=0, bytes_added=0)
                 child_node = walk_dir_recursive(child_entry.path, max_depth, current_depth + 1)
-                if child_node["bytes"] > 0:
-                    node["children"].append(child_node)
-                    node["bytes"] += child_node["bytes"]
-                    node["file_count"] += child_node["file_count"]
+                node["children"].append(child_node)
+                node["bytes"] += child_node["bytes"]
+                node["file_count"] += child_node["file_count"]
         else:
-            # At max depth, just size the child dirs without recursing
+            # At max depth, size the child dirs without recursing — always include them
             for child_entry in child_dirs:
+                locked = False
+                csize = 0
                 try:
                     csize = get_dir_size_fast(child_entry.path)
-                    if csize > 0:
-                        node["children"].append({
-                            "name": child_entry.name,
-                            "path": child_entry.path,
-                            "bytes": csize,
-                            "children": [],
-                            "file_count": 0,
-                        })
-                        node["bytes"] += csize
                 except (PermissionError, OSError):
-                    pass
+                    locked = True
+                node["children"].append({
+                    "name": child_entry.name,
+                    "path": child_entry.path,
+                    "bytes": csize,
+                    "children": [],
+                    "file_count": 0,
+                    "locked": locked,
+                })
+                node["bytes"] += csize
 
         # Add loose files as a single entry if significant
         if loose_files_size > 1024 * 1024 and node["children"]:  # > 1 MB
@@ -1262,12 +1383,11 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
             if entry.is_dir(follow_symlinks=False):
                 # DEEP RECURSIVE WALK
                 dir_node = walk_dir_recursive(entry_path, max_depth=4)
-                if dir_node["bytes"] > 0:
-                    categories[cat]["bytes"] += dir_node["bytes"]
-                    categories[cat]["count"] += 1
-                    dir_node["formatted"] = format_size(dir_node["bytes"])
-                    categories[cat]["dirs"].append(dir_node)
-                    total_mapped += dir_node["bytes"]
+                dir_node["formatted"] = format_size(dir_node["bytes"])
+                categories[cat]["bytes"] += dir_node["bytes"]
+                categories[cat]["count"] += 1
+                categories[cat]["dirs"].append(dir_node)
+                total_mapped += dir_node["bytes"]
             else:
                 try:
                     size = entry.stat(follow_symlinks=False).st_size
@@ -1308,17 +1428,15 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
 
             cat = LIBRARY_CATEGORIES.get(name, "system_data")
 
-            # DEEP RECURSIVE WALK (only 3 levels deep for Library to avoid noise)
+            # DEEP RECURSIVE WALK — always include, even if small/empty
             dir_node = walk_dir_recursive(entry_path, max_depth=3)
-
-            if dir_node["bytes"] > 1024 * 1024:  # > 1 MB
-                dir_node["name"] = f"Library/{name}"
-                dir_node["formatted"] = format_size(dir_node["bytes"])
-                categories[cat]["bytes"] += dir_node["bytes"]
-                categories[cat]["count"] += 1
-                categories[cat]["dirs"].append(dir_node)
-                total_mapped += dir_node["bytes"]
-                tracker.update(entry_path, files=1, bytes_added=dir_node["bytes"])
+            dir_node["name"] = f"Library/{name}"
+            dir_node["formatted"] = format_size(dir_node["bytes"])
+            categories[cat]["bytes"] += dir_node["bytes"]
+            categories[cat]["count"] += 1
+            categories[cat]["dirs"].append(dir_node)
+            total_mapped += dir_node["bytes"]
+            tracker.update(entry_path, files=1, bytes_added=dir_node["bytes"])
 
     except (PermissionError, OSError) as e:
         tracker.record_error(LIBRARY, e)
@@ -1362,6 +1480,60 @@ def scan_full_disk(tracker: ProgressTracker) -> dict:
         total_mapped += total_apps
     except (PermissionError, OSError):
         pass
+
+    # ── 4. Scan remaining top-level disk roots (user-accessible storage only) ──
+    # Now that the `du` .app fork-bomb bug is fixed, we can safely sweep /System,
+    # /private, and other Apple OS directories without crashing photolibraryd.
+    _ALREADY_SCANNED = {HOME, LIBRARY, apps_path}
+    _SKIP_VIRTUAL = {"/dev", "/proc"}  # True virtual kernel interfaces, not real storage
+    emit({
+        "event": "progress",
+        "phase": "full_map",
+        "dir": "Scanning full disk...",
+        "files": tracker.files_processed,
+        "bytes": tracker.bytes_scanned,
+        "rate_mbps": 0, "eta_seconds": -1,
+        "elapsed": round(time.monotonic() - tracker.start_time, 1),
+    })
+    try:
+        for entry in os.scandir("/"):
+            if entry.path in _SKIP_VIRTUAL:
+                continue
+            if entry.path in _ALREADY_SCANNED:
+                continue
+            if not entry.is_dir(follow_symlinks=False) and not entry.is_file(follow_symlinks=False):
+                continue
+            cat = "system_data"
+            if entry.name in ("Users",):
+                # Scan other user home dirs too
+                try:
+                    for user_entry in os.scandir(entry.path):
+                        if user_entry.is_dir(follow_symlinks=False) and user_entry.path != HOME:
+                            user_node = walk_dir_recursive(user_entry.path, max_depth=3)
+                            user_node["formatted"] = format_size(user_node["bytes"])
+                            categories["system_data"]["bytes"] += user_node["bytes"]
+                            categories["system_data"]["count"] += 1
+                            categories["system_data"]["dirs"].append(user_node)
+                            total_mapped += user_node["bytes"]
+                except (PermissionError, OSError):
+                    pass
+                continue
+            if entry.is_dir(follow_symlinks=False):
+                dir_node = walk_dir_recursive(entry.path, max_depth=3)
+                dir_node["formatted"] = format_size(dir_node["bytes"])
+                categories[cat]["bytes"] += dir_node["bytes"]
+                categories[cat]["count"] += 1
+                categories[cat]["dirs"].append(dir_node)
+                total_mapped += dir_node["bytes"]
+            else:
+                try:
+                    size = entry.stat(follow_symlinks=False).st_size
+                    categories[cat]["bytes"] += size
+                    total_mapped += size
+                except OSError:
+                    pass
+    except (PermissionError, OSError) as e:
+        tracker.record_error("/", e)
 
     # ── 4. Sort each category's dirs by size ──
     for cat in categories.values():
@@ -1850,7 +2022,7 @@ def detect_stale_projects(tracker: ProgressTracker) -> list:
 
 # ─── Agent Intelligence: Smart Recommendations ──────────────────────────────
 
-def build_recommendations(items: list, disk_map: dict, stale_projects: list) -> list:
+def build_recommendations(items: list, disk_map: dict, stale_projects: list, macos_insights: dict) -> list:
     """Generate ranked cleanup recommendations with confidence and impact.
     
     Returns list of recommendation dicts:
@@ -1893,6 +2065,102 @@ def build_recommendations(items: list, disk_map: dict, stale_projects: list) -> 
                 "action_type": "delete",
                 "project_path": proj["path"],
                 "days_stale": proj["days_stale"],
+            })
+
+    # ── macOS Intelligence Integrations ──
+    if macos_insights:
+        # Docker
+        if macos_insights.get("docker") and macos_insights["docker"]["reclaimable_bytes"] > 0:
+            dock = macos_insights["docker"]
+            recs.append({
+                "id": "docker_prune",
+                "title": "Prune Docker Environment",
+                "description": dock["recommendation"],
+                "category": "dev_cleanup",
+                "impact_bytes": dock["reclaimable_bytes"],
+                "impact_formatted": format_size(dock["reclaimable_bytes"]),
+                "confidence": 0.9,
+                "risk": "safe",
+                "items": [], 
+                "action_type": "docker_prune" # Special action type for UI
+            })
+
+        # Xcode DerivedData
+        for xc in macos_insights.get("xcode", []):
+            if xc["size"] > 100 * 1024 * 1024: # > 100MB
+                recs.append({
+                    "id": f"xcode_{hashlib.md5(xc['path'].encode()).hexdigest()[:8]}",
+                    "title": f"Clear Xcode DerivedData: {xc['name']}",
+                    "description": f"Has not been built in {xc['days_stale']} days. Safe to delete.",
+                    "category": "dev_cleanup",
+                    "impact_bytes": xc["size"],
+                    "impact_formatted": format_size(xc["size"]),
+                    "confidence": 0.95 if xc["risk"] == "safe" else 0.7,
+                    "risk": xc["risk"],
+                    "items": [xc["path"]],
+                    "action_type": "delete"
+                })
+
+        # iOS Backups
+        for backup in macos_insights.get("ios_backups", []):
+            recs.append({
+                "id": f"ios_{hashlib.md5(backup['path'].encode()).hexdigest()[:8]}",
+                "title": backup["name"],
+                "description": backup["description"],
+                "category": "ios_backup",
+                "impact_bytes": backup["size"],
+                "impact_formatted": format_size(backup["size"]),
+                "confidence": 0.95 if backup["risk"] == "safe" else 0.5,
+                "risk": backup["risk"],
+                "items": [backup["path"]],
+                "action_type": "delete"
+            })
+            
+        # Mail Attachments
+        if macos_insights.get("mail"):
+            mail = macos_insights["mail"]
+            # To delete mail attachments properly might break things, but we flag it
+            recs.append({
+                "id": "mail_attachments",
+                "title": "Large Mail Attachments",
+                "description": f"You have {format_size(mail['size'])} of downloaded attachments.",
+                "category": "mail_cleanup",
+                "impact_bytes": mail["size"],
+                "impact_formatted": format_size(mail["size"]),
+                "confidence": 0.4, # Low confidence, better done via Mail app
+                "risk": "caution",
+                "items": mail["paths"],
+                "action_type": "review"
+            })
+            
+        # Stale Downloads
+        for dl in macos_insights.get("stale_downloads", []):
+            recs.append({
+                "id": f"dl_{hashlib.md5(dl['path'].encode()).hexdigest()[:8]}",
+                "title": f"Clean old download: {dl['name']}",
+                "description": dl["description"] + ". Safe to delete.",
+                "category": "quick_wins",
+                "impact_bytes": dl["size"],
+                "impact_formatted": format_size(dl["size"]),
+                "confidence": 0.95 if dl["risk"] == "safe" else 0.8,
+                "risk": dl["risk"],
+                "items": [dl["path"]],
+                "action_type": "delete"
+            })
+            
+        # Forgotten Installers
+        for installer in macos_insights.get("forgotten_installers", []):
+            recs.append({
+                "id": f"dmg_{hashlib.md5(installer['path'].encode()).hexdigest()[:8]}",
+                "title": f"Remove old installer: {installer['name']}",
+                "description": installer["description"] + ". Often safe to delete after installation.",
+                "category": "quick_wins",
+                "impact_bytes": installer["size"],
+                "impact_formatted": format_size(installer["size"]),
+                "confidence": 0.9,
+                "risk": installer["risk"],
+                "items": [installer["path"]],
+                "action_type": "delete"
             })
 
     # ── Category Aggregates ──
@@ -2282,7 +2550,38 @@ def run_scan():
         "eta_seconds": -1, "elapsed": 0,
     })
 
-    # ── Pass 1: Fast Scan — known locations ──
+    # ── FDA Status Probe ──────────────────────────────────────────────────────
+    # Emit an fda_status event so the frontend knows our actual read access
+    # before we start reporting items. This is a secondary check — the
+    # authoritative probe runs in the Electron main process before this
+    # subprocess is even spawned. This handles the rare case where FDA is
+    # revoked between the main process probe and this point.
+    _fda_probe_paths = [
+        os.path.join(HOME, "Library", "Safari", "History.db"),
+        os.path.join(HOME, "Library", "Messages", "chat.db"),
+        os.path.join(HOME, "Library", "Mail"),
+    ]
+    _fda_granted = True  # assume granted until proven otherwise
+    _fda_skipped_protected = []
+    for _probe_path in _fda_probe_paths:
+        if os.path.exists(_probe_path):
+            if not os.access(_probe_path, os.R_OK):
+                _fda_granted = False
+                # Collect known FDA-protected paths that will be skipped
+                _fda_skipped_protected = [
+                    os.path.join(HOME, "Library", "Mail"),
+                    os.path.join(HOME, "Library", "Safari"),
+                    os.path.join(HOME, "Library", "Messages"),
+                    os.path.join(HOME, "Library", "HomeKit"),
+                ]
+            break  # definitive result from first found path
+    emit({
+        "event": "fda_status",
+        "fda_granted": _fda_granted,
+        "skipped_protected_dirs": _fda_skipped_protected if not _fda_granted else [],
+    })
+
+
     tracker.phase = "fast"
     all_items.extend(scan_browser_caches(tracker))
     all_items.extend(scan_app_caches(tracker))
@@ -2309,6 +2608,11 @@ def run_scan():
 
     # ── Pass 4: Agent Intelligence ──
     stale_projects = detect_stale_projects(tracker)
+    
+    # Gather macOS integrations
+    tracker.phase = "macos_intelligence"
+    tracker.update("Gathering System Insights...")
+    macos_insights = macos_intelligence.gather_macos_intelligence()
 
     # ── Build completion payload ──
     duration = round(time.monotonic() - start_time, 2)
@@ -2326,7 +2630,7 @@ def run_scan():
     metrics["hidden_space"] = disk_map["hidden_space"]
 
     # Smart recommendations
-    recommendations = build_recommendations(all_items, disk_map, stale_projects)
+    recommendations = build_recommendations(all_items, disk_map, stale_projects, macos_insights)
 
     # Storage timeline + prediction
     timeline = []

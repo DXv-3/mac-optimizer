@@ -1,6 +1,6 @@
-import React, { useMemo } from 'react';
+import React, { useMemo, useRef, useEffect, useState } from 'react';
 import { motion } from 'framer-motion';
-import { Loader2, FolderSearch, Zap, Clock, AlertTriangle } from 'lucide-react';
+import { Loader2, FolderSearch, Zap, Clock, AlertTriangle, Download, CheckCircle2, Info, XCircle } from 'lucide-react';
 
 const CATEGORY_COLORS = {
     browser_cache: { name: 'Browser', bar: 'bg-cyan-500' },
@@ -18,240 +18,189 @@ const formatSize = (bytes) => {
     return `${(bytes / Math.pow(1024, i)).toFixed(2)} ${units[i]}`;
 };
 
-export default function ScanProgress({ progress, items, categories, warnings = [] }) {
+export default function ScanProgress({ progress, items, categories, warnings = [], log = [] }) {
+    const scrollRef = useRef(null);
+    const [searchQuery, setSearchQuery] = useState('');
+
     const phase = progress?.phase || 'fast';
     const dir = progress?.currentPath || progress?.dir || 'Initializing...';
     const filesProcessed = progress?.filesProcessed || progress?.files || 0;
     const bytesScanned = progress?.bytesScanned || progress?.bytes || 0;
     const rateMbps = progress?.scanRateMbps || progress?.rate_mbps || 0;
     const elapsed = progress?.elapsed || 0;
-    const etaSeconds = progress?.etaSeconds || 0;
     const errorCount = progress?.errorCount || 0;
 
-    // Live category breakdown from streamed items 
-    const liveCategories = useMemo(() => {
-        const cats = {};
-        let total = 0;
-        for (const item of items) {
-            const cat = item.category || 'general_cache';
-            const size = item.sizeBytes || item.size || 0;
-            if (!cats[cat]) cats[cat] = { bytes: 0, count: 0 };
-            cats[cat].bytes += size;
-            cats[cat].count += 1;
-            total += size;
+    // Auto-scroll log to bottom
+    useEffect(() => {
+        if (scrollRef.current) {
+            scrollRef.current.scrollTop = scrollRef.current.scrollHeight;
         }
-        return Object.entries(cats)
-            .map(([id, data]) => ({ id, ...data, pct: total > 0 ? (data.bytes / total) * 100 : 0 }))
-            .sort((a, b) => b.bytes - a.bytes);
-    }, [items]);
+    }, [log.length]);
+
+    const filteredLog = useMemo(() => {
+        if (!searchQuery) return log;
+        try {
+            const regex = new RegExp(searchQuery, 'i');
+            return log.filter(entry => regex.test(entry.path) || regex.test(entry.message));
+        } catch {
+            const q = searchQuery.toLowerCase();
+            return log.filter(entry => entry.path?.toLowerCase().includes(q) || entry.message?.toLowerCase().includes(q));
+        }
+    }, [log, searchQuery]);
 
     const totalDiscovered = useMemo(() =>
         items.reduce((s, i) => s + (i.sizeBytes || i.size || 0), 0), [items]);
 
+    const exportCSV = () => {
+        const csv = ['Status,Path,Message,Timestamp']
+            .concat(log.map(e => `${e.status},"${e.path}","${e.message || ''}",${new Date(e.timestamp).toISOString()}`))
+            .join('\n');
+        const blob = new Blob([csv], { type: 'text/csv' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = `scan-log-${new Date().toISOString().slice(0, 10)}.csv`;
+        a.click();
+        URL.revokeObjectURL(url);
+    };
+
     return (
-        <div className="space-y-5">
-            {/* Main scanning card */}
-            <motion.div
-                layout
-                className="bg-white/[0.03] backdrop-blur-[20px] border border-white/[0.08] shadow-[inset_0_1px_1px_rgba(255,255,255,0.06),0_20px_60px_-20px_rgba(0,0,0,0.5)] rounded-[28px] p-8 relative overflow-hidden"
-            >
-                {/* Animated background pulse */}
-                <motion.div
-                    animate={{ opacity: [0.05, 0.15, 0.05], scale: [1, 1.1, 1] }}
-                    transition={{ duration: 3, repeat: Infinity, ease: 'easeInOut' }}
-                    className="absolute inset-0 bg-gradient-to-br from-cyan-500/10 to-blue-500/5 rounded-[28px]"
-                />
-
-                {/* Particle dots */}
-                <div className="absolute inset-0 overflow-hidden rounded-[28px]">
-                    {[...Array(8)].map((_, i) => (
-                        <motion.div
-                            key={i}
-                            animate={{
-                                x: [Math.random() * 100, Math.random() * 200 - 50],
-                                y: [Math.random() * 100, Math.random() * 200 - 50],
-                                opacity: [0, 0.6, 0],
-                            }}
-                            transition={{ duration: 3 + Math.random() * 2, repeat: Infinity, delay: Math.random() * 2, ease: 'easeInOut' }}
-                            className="absolute w-1 h-1 rounded-full bg-cyan-400"
-                            style={{ left: `${10 + Math.random() * 80}%`, top: `${10 + Math.random() * 80}%` }}
-                        />
-                    ))}
-                </div>
-
-                <div className="relative z-10">
-                    <div className="flex items-center gap-4 mb-6">
-                        <div className="relative">
-                            <motion.div
-                                animate={{ rotate: 360 }}
-                                transition={{ duration: 2, repeat: Infinity, ease: 'linear' }}
-                                className="w-12 h-12 border-[3px] border-cyan-500/20 border-t-cyan-400 rounded-full"
-                            />
-                            <motion.div
-                                animate={{ scale: [1, 1.5, 1], opacity: [0.5, 0, 0.5] }}
-                                transition={{ duration: 2, repeat: Infinity }}
-                                className="absolute inset-0 w-12 h-12 bg-cyan-500/15 rounded-full"
-                            />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                            <div className="flex items-center gap-2">
-                                <h3 className="text-xl font-bold text-white">
-                                    {phase === 'fast' ? 'Quick Scan' : 'Deep Analysis'}
-                                </h3>
-                                <span className={`text-[10px] uppercase tracking-[0.15em] font-semibold px-2 py-0.5 rounded-full ${phase === 'fast' ? 'bg-cyan-500/15 text-cyan-400' : 'bg-violet-500/15 text-violet-400'}`}>
-                                    {phase === 'fast' ? 'Pass 1' : 'Pass 2'}
-                                </span>
-                            </div>
-                            <motion.p
-                                key={dir}
-                                initial={{ opacity: 0, x: -10 }}
-                                animate={{ opacity: 1, x: 0 }}
-                                className="text-zinc-500 text-sm mt-0.5 font-mono truncate"
-                            >
-                                {dir}
-                            </motion.p>
-                        </div>
-
-                        {/* Live total discovered */}
-                        <div className="text-right">
-                            <div className="text-2xl font-bold text-cyan-400">{formatSize(totalDiscovered)}</div>
-                            <div className="text-[10px] text-zinc-600 uppercase tracking-wider">discovered</div>
-                        </div>
-                    </div>
-
-                    {/* Progress bar */}
-                    <div className="w-full h-1.5 bg-white/[0.05] rounded-full overflow-hidden mb-5">
-                        <motion.div
-                            initial={{ width: '0%' }}
-                            animate={{ width: phase === 'fast' ? '45%' : '90%' }}
-                            transition={{ duration: phase === 'fast' ? 30 : 60, ease: 'easeOut' }}
-                            className="h-full rounded-full bg-gradient-to-r from-cyan-500 to-blue-500 relative"
-                        >
-                            <motion.div
-                                animate={{ x: ['-100%', '200%'] }}
-                                transition={{ duration: 1.5, repeat: Infinity, ease: 'easeInOut' }}
-                                className="absolute inset-0 bg-gradient-to-r from-transparent via-white/30 to-transparent"
-                            />
-                        </motion.div>
-                    </div>
-
-                    {/* Stats row */}
-                    <div className="grid grid-cols-4 gap-3">
-                        <StatPill label="Files" value={filesProcessed.toLocaleString()} icon={<FolderSearch size={12} />} />
-                        <StatPill label="Scanned" value={formatSize(bytesScanned)} icon={<Zap size={12} />} />
-                        <StatPill label="Rate" value={`${rateMbps.toFixed(1)} MB/s`} />
-                        <StatPill label="Elapsed" value={`${Math.floor(elapsed / 60)}:${String(Math.floor(elapsed % 60)).padStart(2, '0')}`} icon={<Clock size={12} />} />
-                    </div>
-
-                    {/* Error indicator */}
-                    {errorCount > 0 && (
-                        <div className="mt-3 text-xs text-amber-400/80 flex items-center gap-1.5">
-                            <AlertTriangle size={12} />
-                            {errorCount} permission error{errorCount !== 1 ? 's' : ''} (some folders skipped)
-                        </div>
-                    )}
-                </div>
-            </motion.div>
-
-            {/* Warning banners (e.g. low disk space) */}
+        <div className="space-y-4 h-full flex flex-col">
             {warnings.length > 0 && (
                 <motion.div
                     initial={{ opacity: 0, y: -10 }}
                     animate={{ opacity: 1, y: 0 }}
-                    className="bg-amber-500/[0.07] border border-amber-500/20 text-amber-400 px-4 py-2.5 rounded-xl flex items-center gap-2 text-sm"
+                    className="bg-amber-500/[0.07] border border-amber-500/20 text-amber-400 px-4 py-2.5 rounded-xl flex items-center gap-2 text-sm shrink-0"
                 >
                     <AlertTriangle size={14} className="flex-shrink-0" />
                     <span>{warnings[warnings.length - 1].message}</span>
                 </motion.div>
             )}
 
-            {/* Live category breakdown bar */}
-            {liveCategories.length > 0 && (
-                <motion.div
-                    initial={{ opacity: 0, y: 15 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    className="bg-white/[0.02] backdrop-blur-md border border-white/[0.06] rounded-2xl p-4"
-                >
-                    <div className="flex items-center justify-between mb-2.5">
-                        <span className="text-xs uppercase tracking-[0.15em] text-zinc-500 font-semibold">
-                            Category Breakdown
+            <motion.div
+                layout
+                className="bg-white/[0.03] backdrop-blur-[20px] border border-white/[0.08] shadow-[inset_0_1px_1px_rgba(255,255,255,0.06),0_20px_60px_-20px_rgba(0,0,0,0.5)] rounded-[28px] overflow-hidden flex-1 flex flex-col min-h-0"
+            >
+                {/* Header Strip */}
+                <div className="flex items-center justify-between px-6 py-4 border-b border-white/[0.06] bg-black/20 shrink-0">
+                    <div className="flex items-center gap-3">
+                        <Loader2 size={16} className="text-cyan-400 animate-spin" />
+                        <span className="text-sm font-medium text-white">
+                            {phase === 'fast' ? 'Quick Scan' : 'Deep Analysis'}
                         </span>
-                        <span className="text-xs text-cyan-400 font-bold">
-                            {items.length} items • {formatSize(totalDiscovered)}
+                        <span className={`text-[10px] uppercase tracking-[0.15em] font-semibold px-2 py-0.5 rounded-full ${phase === 'fast' ? 'bg-cyan-500/15 text-cyan-400' : 'bg-violet-500/15 text-violet-400'}`}>
+                            {phase === 'fast' ? 'Pass 1' : 'Pass 2'}
                         </span>
                     </div>
-                    {/* Stacked bar */}
-                    <div className="flex h-3 rounded-full overflow-hidden bg-white/[0.04] mb-3">
-                        {liveCategories.map((cat, idx) => {
-                            const meta = CATEGORY_COLORS[cat.id] || { bar: 'bg-indigo-500' };
-                            return (
-                                <motion.div
-                                    key={cat.id}
-                                    initial={{ width: 0 }}
-                                    animate={{ width: `${cat.pct}%` }}
-                                    transition={{ duration: 0.4, ease: [0.22, 1, 0.36, 1] }}
-                                    className={`h-full ${meta.bar} ${idx > 0 ? 'border-l border-black/20' : ''}`}
-                                />
-                            );
-                        })}
+                    <div className="flex items-center gap-4 text-xs">
+                        <span className="text-zinc-400">Errors: <span className="text-red-400">{errorCount}</span></span>
+                        <span className="text-cyan-400 font-mono font-bold">{formatSize(totalDiscovered)} found</span>
                     </div>
-                    {/* Legend */}
-                    <div className="grid grid-cols-3 gap-2">
-                        {liveCategories.map(cat => {
-                            const meta = CATEGORY_COLORS[cat.id] || { name: cat.id, bar: 'bg-indigo-500' };
-                            return (
-                                <div key={cat.id} className="flex items-center gap-2 text-xs">
-                                    <span className={`w-2.5 h-2.5 rounded-sm flex-shrink-0 ${meta.bar}`} />
-                                    <span className="text-zinc-400 truncate">{meta.name}</span>
-                                    <span className="text-zinc-600 font-mono ml-auto">{formatSize(cat.bytes)}</span>
-                                </div>
-                            );
-                        })}
-                    </div>
-                </motion.div>
-            )}
+                </div>
 
-            {/* Live discovered items feed */}
-            {items.length > 0 && (
-                <motion.div
-                    initial={{ opacity: 0, y: 20 }}
-                    animate={{ opacity: 1, y: 0 }}
-                    className="bg-white/[0.02] backdrop-blur-md border border-white/[0.06] rounded-2xl p-5"
-                >
-                    <div className="flex items-center justify-between mb-3">
-                        <span className="text-xs uppercase tracking-[0.15em] text-zinc-500 font-semibold">
-                            Latest Discoveries
-                        </span>
-                    </div>
-                    <div className="space-y-1.5 max-h-[200px] overflow-y-auto">
-                        {items.slice(-10).reverse().map((item, idx) => (
+                {/* Dual-pane layout */}
+                <div className="flex-1 min-h-0 grid grid-cols-1 lg:grid-cols-2 divide-x divide-white/[0.06]">
+
+                    {/* Left: Progress Tracking */}
+                    <div className="p-6 flex flex-col min-h-0 overflow-y-auto">
+                        <div className="flex items-center gap-4 mb-6">
+                            <div className="relative shrink-0">
+                                <motion.div
+                                    animate={{ rotate: 360 }}
+                                    transition={{ duration: 2, repeat: Infinity, ease: 'linear' }}
+                                    className="w-12 h-12 border-[3px] border-cyan-500/20 border-t-cyan-400 rounded-full"
+                                />
+                            </div>
+                            <div className="flex-1 min-w-0">
+                                <motion.p
+                                    key={dir}
+                                    initial={{ opacity: 0 }}
+                                    animate={{ opacity: 1 }}
+                                    className="text-zinc-300 text-sm font-mono truncate"
+                                >
+                                    {dir}
+                                </motion.p>
+                            </div>
+                        </div>
+
+                        <div className="w-full h-1.5 bg-white/[0.05] rounded-full overflow-hidden mb-6 shrink-0">
                             <motion.div
-                                key={item.path}
-                                initial={{ opacity: 0, x: -10 }}
-                                animate={{ opacity: 1, x: 0 }}
-                                transition={{ delay: idx * 0.03 }}
-                                className="flex items-center justify-between py-1.5 px-2 rounded-lg hover:bg-white/[0.03] transition-colors"
-                            >
-                                <div className="flex items-center gap-2 min-w-0 flex-1">
-                                    <span className={`w-1.5 h-1.5 rounded-full flex-shrink-0 ${item.risk === 'safe' ? 'bg-emerald-400' : item.risk === 'caution' ? 'bg-amber-400' : 'bg-red-400'}`} />
-                                    <span className="text-sm text-zinc-300 truncate">{item.name}</span>
-                                </div>
-                                <span className="text-sm text-zinc-500 font-mono ml-2 flex-shrink-0">
-                                    {item.sizeFormatted || item.size_formatted || formatSize(item.sizeBytes || item.size || 0)}
-                                </span>
-                            </motion.div>
-                        ))}
+                                initial={{ width: '0%' }}
+                                animate={{ width: phase === 'fast' ? '45%' : '90%' }}
+                                transition={{ duration: phase === 'fast' ? 30 : 60, ease: 'easeOut' }}
+                                className="h-full rounded-full bg-gradient-to-r from-cyan-500 to-blue-500"
+                            />
+                        </div>
+
+                        <div className="grid grid-cols-2 gap-3 shrink-0 mb-6">
+                            <StatPill label="Files Checked" value={filesProcessed.toLocaleString()} icon={<FolderSearch size={12} />} />
+                            <StatPill label="Data Scanned" value={formatSize(bytesScanned)} icon={<Zap size={12} />} />
+                            <StatPill label="Scan Rate" value={`${rateMbps.toFixed(1)} MB/s`} />
+                            <StatPill label="Time Elapsed" value={`${Math.floor(elapsed / 60)}:${String(Math.floor(elapsed % 60)).padStart(2, '0')}`} icon={<Clock size={12} />} />
+                        </div>
                     </div>
-                </motion.div>
-            )}
+
+                    {/* Right: Action Log */}
+                    <div className="flex flex-col min-h-0 bg-black/10">
+                        <div className="flex items-center gap-2 px-4 py-2.5 border-b border-white/[0.04] shrink-0">
+                            <input
+                                type="text"
+                                value={searchQuery}
+                                onChange={(e) => setSearchQuery(e.target.value)}
+                                placeholder="Filter scan events..."
+                                className="flex-1 bg-transparent text-[11px] text-zinc-300 placeholder-zinc-500 outline-none"
+                            />
+                            <button
+                                onClick={exportCSV}
+                                className="text-zinc-500 hover:text-zinc-300 transition-colors"
+                                title="Export scan log to CSV"
+                            >
+                                <Download size={13} />
+                            </button>
+                        </div>
+                        <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-2 space-y-1">
+                            {filteredLog.map((entry, i) => (
+                                <div key={i} className="flex items-start gap-2 text-[11px] py-1 border-b border-white/[0.02] last:border-0">
+                                    {entry.status === 'success' && <CheckCircle2 size={12} className="text-emerald-400 mt-0.5 shrink-0" />}
+                                    {entry.status === 'error' && <XCircle size={12} className="text-red-400 mt-0.5 shrink-0" />}
+                                    {entry.status === 'warning' && <AlertTriangle size={12} className="text-amber-400 mt-0.5 shrink-0" />}
+                                    {entry.status === 'info' && <Info size={12} className="text-cyan-400 mt-0.5 shrink-0" />}
+
+                                    <div className={`flex-1 min-w-0 ${entry.status === 'error' ? 'select-text cursor-text' : ''}`}>
+                                        <div className={`truncate font-mono ${entry.status === 'success' ? 'text-zinc-300' :
+                                            entry.status === 'error' ? 'text-red-400/90' :
+                                                entry.status === 'warning' ? 'text-amber-400/90' :
+                                                    'text-zinc-500'
+                                            }`}>
+                                            {entry.path}
+                                        </div>
+                                        {entry.message && (
+                                            <div className="text-zinc-500 text-[10px] mt-0.5">{entry.message}</div>
+                                        )}
+                                    </div>
+                                    {entry.freedBytes > 0 && (
+                                        <span className="text-zinc-400 font-mono shrink-0 ml-2">{formatSize(entry.freedBytes)}</span>
+                                    )}
+                                </div>
+                            ))}
+                            {filteredLog.length === 0 && (
+                                <div className="text-[11px] text-zinc-600 py-4 text-center">
+                                    {log.length === 0 ? 'Awaiting scan events...' : 'No events match filter'}
+                                </div>
+                            )}
+                        </div>
+                    </div>
+
+                </div>
+            </motion.div>
         </div>
     );
 }
 
 function StatPill({ label, value, icon }) {
     return (
-        <div className="bg-white/[0.03] border border-white/[0.06] rounded-xl px-3 py-2.5 text-center">
-            <div className="text-[10px] uppercase tracking-[0.12em] text-zinc-600 font-medium mb-1 flex items-center justify-center gap-1">
+        <div className="bg-white/[0.02] border border-white/[0.04] rounded-xl px-4 py-3 text-center">
+            <div className="text-[10px] uppercase tracking-[0.12em] text-zinc-500 font-medium mb-1.5 flex items-center justify-center gap-1.5">
                 {icon}
                 {label}
             </div>

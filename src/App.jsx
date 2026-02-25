@@ -1,5 +1,5 @@
 import React from 'react';
-import { Shield, Trash2, LayoutGrid, HardDrive } from 'lucide-react';
+import { Shield, Trash2, LayoutGrid, HardDrive, AlertTriangle, X } from 'lucide-react';
 import { AnimatePresence, motion } from 'framer-motion';
 import useStore from './store/useStore';
 import SmartCareDashboard from './components/SmartCareDashboard';
@@ -7,96 +7,199 @@ import SystemCleanupModule from './components/SystemCleanupModule';
 import AppTelemetryManager from './components/AppTelemetryManager';
 import StorageAnalyzer from './components/storage/StorageAnalyzer';
 
-const pageTransition = {
-    initial: { opacity: 0, y: 12, filter: 'blur(6px)' },
-    animate: { opacity: 1, y: 0, filter: 'blur(0px)' },
-    exit: { opacity: 0, y: -12, filter: 'blur(6px)' },
-    transition: { duration: 0.35, ease: [0.22, 1, 0.36, 1] }
+// ─── Page transition (250ms macOS-native ease) ───────────────────────────────
+const transition = { duration: 0.25, ease: [0.22, 1, 0.36, 1] };
+const pageVariants = {
+    initial: { opacity: 0, y: 12, scale: 0.98, filter: 'blur(4px)' },
+    animate: { opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' },
+    exit: { opacity: 0, y: -8, scale: 0.98, filter: 'blur(4px)' },
+};
+
+// ─── Tab config ──────────────────────────────────────────────────────────────
+const TABS = [
+    { id: 'smartCare', icon: Shield, label: 'Smart Care', accent: 'from-violet-500 to-purple-600' },
+    { id: 'cleanup', icon: Trash2, label: 'Cleanup', accent: 'from-green-400  to-emerald-500' },
+    { id: 'apps', icon: LayoutGrid, label: 'Applications', accent: 'from-sky-400    to-blue-500' },
+    { id: 'storage', icon: HardDrive, label: 'Storage', accent: 'from-orange-400 to-amber-500' },
+];
+
+// ─── Background gradient per tab (mirrors CleanMyMac's dynamic bg) ───────────
+const BG = {
+    smartCare: 'from-[#1a0533] via-[#230441] to-[#0d0220]',
+    cleanup: 'from-[#012b10] via-[#013d18] to-[#000e06]',
+    apps: 'from-[#001a33] via-[#01254d] to-[#000a1a]',
+    storage: 'from-[#2b1400] via-[#3d1d00] to-[#0d0600]',
 };
 
 function App() {
     const { activeTab, setActiveTab, error } = useStore();
 
+    const activeConfig = TABS.find(t => t.id === activeTab) ?? TABS[0];
+
     return (
-        <div className="flex h-screen text-white font-sans selection:bg-fuchsia-500/30 bg-[radial-gradient(ellipse_at_top_left,_var(--tw-gradient-stops))] from-[#2A0A4A] to-[#0F0518]">
-            {/* Sidebar */}
-            <aside className="w-56 bg-zinc-950/40 backdrop-blur-xl border-r border-white/[0.06] flex flex-col pt-10 relative z-20">
-                <div className="px-6 mb-8 pb-4 pt-2 -mt-10" style={{ WebkitAppRegion: 'drag' }}>
-                    <div className="mt-8">
-                        <h1 className="text-xl font-bold text-white tracking-tight">Optimization</h1>
-                        <p className="text-xs text-fuchsia-400/80 mt-0.5 font-medium tracking-wide">System Nexus</p>
+        <div
+            className={`flex h-screen text-white relative overflow-hidden bg-gradient-to-br ${BG[activeTab]}`}
+            style={{ fontFamily: "-apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Helvetica Neue', sans-serif" }}
+        >
+            {/* Dynamic ambient orb — fades between tabs */}
+            <AnimatePresence mode="wait">
+                <motion.div
+                    key={activeTab + '-orb'}
+                    initial={{ opacity: 0, scale: 0.8 }}
+                    animate={{ opacity: 0.35, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.8 }}
+                    transition={{ duration: 0.6 }}
+                    className={`absolute top-[-180px] left-[80px] w-[600px] h-[600px] rounded-full bg-gradient-to-br ${activeConfig.accent} blur-[120px] pointer-events-none`}
+                />
+            </AnimatePresence>
+
+            {/* ─── Slim icon sidebar (CleanMyMac style ~64px) ──────────────── */}
+            <aside
+                className="w-[72px] flex flex-col items-center py-6 gap-1 relative z-20 select-none"
+                style={{
+                    background: 'rgba(10, 4, 18, 0.55)',
+                    backdropFilter: 'blur(24px)',
+                    WebkitBackdropFilter: 'blur(24px)',
+                    borderRight: '1px solid rgba(255,255,255,0.06)',
+                    WebkitAppRegion: 'drag',
+                }}
+            >
+                {/* Traffic lights area */}
+                <div className="h-7 mb-3" />
+
+                {/* Logo mark */}
+                <div className="mb-5 flex flex-col items-center gap-1.5">
+                    <div className={`w-9 h-9 rounded-[11px] bg-gradient-to-br ${activeConfig.accent} flex items-center justify-center shadow-lg`}>
+                        <Shield size={18} className="text-white" />
                     </div>
                 </div>
 
-                <nav className="flex-1 px-3 space-y-1">
-                    <SidebarItem icon={<Shield size={18} />} label="Smart Care" isActive={activeTab === 'smartCare'} onClick={() => setActiveTab('smartCare')} />
-                    <SidebarItem icon={<Trash2 size={18} />} label="Cleanup" isActive={activeTab === 'cleanup'} onClick={() => setActiveTab('cleanup')} />
-                    <SidebarItem icon={<LayoutGrid size={18} />} label="Applications" isActive={activeTab === 'apps'} onClick={() => setActiveTab('apps')} />
-                    <SidebarItem icon={<HardDrive size={18} />} label="Storage" isActive={activeTab === 'storage'} onClick={() => setActiveTab('storage')} />
+                {/* Nav items */}
+                <nav className="flex flex-col gap-1 w-full px-2" style={{ WebkitAppRegion: 'no-drag' }}>
+                    {TABS.map(({ id, icon: Icon, label, accent }) => {
+                        const isActive = activeTab === id;
+                        return (
+                            <motion.button
+                                key={id}
+                                onClick={() => setActiveTab(id)}
+                                whileHover={{ scale: 1.08 }}
+                                whileTap={{ scale: 0.94 }}
+                                title={label}
+                                className="relative flex flex-col items-center justify-center w-full aspect-square rounded-[14px] transition-colors group"
+                                style={{ WebkitAppRegion: 'no-drag' }}
+                            >
+                                {isActive && (
+                                    <motion.div
+                                        layoutId="sidebar-bg"
+                                        className="absolute inset-0 rounded-[14px]"
+                                        style={{
+                                            background: 'rgba(255,255,255,0.1)',
+                                            border: '1px solid rgba(255,255,255,0.12)',
+                                        }}
+                                        transition={{ type: 'spring', stiffness: 400, damping: 35 }}
+                                    />
+                                )}
+                                {/* Glow behind active icon */}
+                                {isActive && (
+                                    <motion.div
+                                        layoutId="sidebar-glow"
+                                        className={`absolute inset-0 rounded-[14px] opacity-30 blur-sm bg-gradient-to-br ${accent}`}
+                                        transition={{ type: 'spring', stiffness: 400, damping: 35 }}
+                                    />
+                                )}
+                                <Icon
+                                    size={20}
+                                    className={`relative z-10 transition-colors ${isActive ? 'text-white' : 'text-white/40 group-hover:text-white/70'}`}
+                                />
+                            </motion.button>
+                        );
+                    })}
                 </nav>
 
-                {/* Sidebar Footer */}
-                <div className="px-4 py-4 border-t border-white/[0.04]">
-                    <div className="text-[10px] text-zinc-600 uppercase tracking-[0.15em]">v1.0 — System Nexus</div>
+                {/* Bottom label */}
+                <div className="mt-auto text-[8px] text-white/20 tracking-widest uppercase rotate-180"
+                    style={{ writingMode: 'vertical-rl' }}>
+                    Nexus
                 </div>
             </aside>
 
-            {/* Main Content Area */}
+            {/* ─── Main content ─────────────────────────────────────────────── */}
             <main className="flex-1 flex flex-col relative overflow-hidden">
-                {/* Top Title Bar - Drag Region */}
-                <div className="h-14 flex items-center px-8 border-b border-white/[0.04] w-full shrink-0 backdrop-blur-md bg-white/[0.01] relative z-10" style={{ WebkitAppRegion: 'drag' }}>
+                {/* Title bar drag region */}
+                <div
+                    className="h-10 flex-shrink-0 flex items-center px-4"
+                    style={{ WebkitAppRegion: 'drag' }}
+                >
                     <AnimatePresence mode="wait">
-                        <motion.div
-                            key={activeTab}
-                            initial={{ opacity: 0, y: 5 }}
+                        <motion.span
+                            key={activeTab + '-label'}
+                            initial={{ opacity: 0, y: 4 }}
                             animate={{ opacity: 1, y: 0 }}
-                            exit={{ opacity: 0, y: -5 }}
+                            exit={{ opacity: 0, y: -4 }}
                             transition={{ duration: 0.2 }}
-                            className="text-sm font-medium text-zinc-400"
+                            className="text-[13px] font-semibold text-white/40 tracking-wide"
                         >
-                            {activeTab === 'smartCare' && 'Smart Care Overview'}
-                            {activeTab === 'cleanup' && 'System Cleanup'}
-                            {activeTab === 'apps' && 'Application Telemetry'}
-                            {activeTab === 'storage' && 'Storage Analyzer'}
-                        </motion.div>
+                            {activeConfig.label}
+                        </motion.span>
                     </AnimatePresence>
                 </div>
 
-                {/* Scrollable Content */}
-                <div className="flex-1 overflow-y-auto p-8 relative">
-                    {/* Error Overlay */}
+                {/* Scrollable content panel */}
+                <div
+                    className="flex-1 overflow-y-auto m-3 mt-0 rounded-2xl relative"
+                    style={{
+                        background: 'rgba(255,255,255,0.04)',
+                        backdropFilter: 'blur(24px)',
+                        WebkitBackdropFilter: 'blur(24px)',
+                        border: '1px solid rgba(255,255,255,0.07)',
+                    }}
+                >
+                    {/* Error toast */}
                     <AnimatePresence>
                         {error && (
                             <motion.div
-                                initial={{ opacity: 0, y: -20, filter: 'blur(4px)' }}
-                                animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
-                                exit={{ opacity: 0, y: -20, filter: 'blur(4px)' }}
-                                className="absolute top-4 left-1/2 -translate-x-1/2 z-50 bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-2xl flex items-center shadow-2xl backdrop-blur-xl"
+                                initial={{ opacity: 0, y: -20 }}
+                                animate={{ opacity: 1, y: 0 }}
+                                exit={{ opacity: 0, y: -20 }}
+                                transition={transition}
+                                className="absolute top-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2.5 rounded-2xl text-sm text-red-300"
+                                style={{
+                                    background: 'rgba(255,60,48,0.12)',
+                                    backdropFilter: 'blur(16px)',
+                                    border: '1px solid rgba(255,60,48,0.25)',
+                                }}
                             >
-                                <span className="mr-2">⚠️</span>
-                                <span className="text-sm">{error}</span>
+                                <AlertTriangle size={14} className="flex-shrink-0" />
+                                <span className="font-medium">{error}</span>
+                                <button
+                                    onClick={() => useStore.setState({ error: null })}
+                                    className="ml-2 opacity-60 hover:opacity-100 transition-opacity"
+                                >
+                                    <X size={13} />
+                                </button>
                             </motion.div>
                         )}
                     </AnimatePresence>
 
+                    {/* Page content with slide transition */}
                     <AnimatePresence mode="wait">
                         {activeTab === 'smartCare' && (
-                            <motion.div key="smartCare" {...pageTransition} className="h-full">
+                            <motion.div key="smartCare" variants={pageVariants} initial="initial" animate="animate" exit="exit" transition={transition} className="h-full">
                                 <SmartCareDashboard />
                             </motion.div>
                         )}
                         {activeTab === 'cleanup' && (
-                            <motion.div key="cleanup" {...pageTransition} className="h-full">
+                            <motion.div key="cleanup" variants={pageVariants} initial="initial" animate="animate" exit="exit" transition={transition} className="h-full">
                                 <SystemCleanupModule />
                             </motion.div>
                         )}
                         {activeTab === 'apps' && (
-                            <motion.div key="apps" {...pageTransition} className="h-full">
+                            <motion.div key="apps" variants={pageVariants} initial="initial" animate="animate" exit="exit" transition={transition} className="h-full">
                                 <AppTelemetryManager />
                             </motion.div>
                         )}
                         {activeTab === 'storage' && (
-                            <motion.div key="storage" {...pageTransition} className="h-full">
+                            <motion.div key="storage" variants={pageVariants} initial="initial" animate="animate" exit="exit" transition={transition} className="h-full">
                                 <StorageAnalyzer />
                             </motion.div>
                         )}
@@ -104,39 +207,6 @@ function App() {
                 </div>
             </main>
         </div>
-    );
-}
-
-function SidebarItem({ icon, label, isActive, onClick }) {
-    return (
-        <motion.button
-            onClick={onClick}
-            whileHover={{ x: 2 }}
-            whileTap={{ scale: 0.97 }}
-            className={`w-full flex items-center px-4 py-2.5 rounded-xl transition-colors text-sm font-medium relative overflow-hidden ${isActive
-                ? 'text-white'
-                : 'text-zinc-500 hover:text-zinc-200'
-                }`}
-        >
-            {isActive && (
-                <motion.div
-                    layoutId="sidebar-active"
-                    className="absolute inset-0 bg-white/[0.07] border border-white/[0.08] rounded-xl"
-                    initial={false}
-                    transition={{ type: "spring", stiffness: 350, damping: 30 }}
-                />
-            )}
-            <span className={`relative z-10 mr-3 transition-colors ${isActive ? 'text-fuchsia-400' : 'opacity-60'}`}>{icon}</span>
-            <span className="relative z-10">{label}</span>
-            {isActive && (
-                <motion.div
-                    layoutId="sidebar-dot"
-                    className="absolute left-0 top-1/2 -translate-y-1/2 w-[3px] h-5 bg-fuchsia-400 rounded-r-full"
-                    initial={false}
-                    transition={{ type: "spring", stiffness: 350, damping: 30 }}
-                />
-            )}
-        </motion.button>
     );
 }
 

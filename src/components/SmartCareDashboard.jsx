@@ -27,7 +27,7 @@ export default function SmartCareDashboard() {
                         initial={{ opacity: 0, height: 0 }}
                         animate={{ opacity: 1, height: 'auto' }}
                         exit={{ opacity: 0, height: 0 }}
-                        className="bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-2xl flex items-center backdrop-blur-xl overflow-hidden"
+                        className="bg-red-500/10 border border-red-500/20 text-red-400 p-4 rounded-2xl flex items-center backdrop-blur-xl overflow-hidden select-text cursor-text"
                     >
                         <span className="mr-2">⚠️</span>
                         <span>{error}</span>
@@ -45,13 +45,13 @@ export default function SmartCareDashboard() {
                 <motion.div
                     animate={orbFloat}
                     className={`absolute top-0 right-0 w-72 h-72 rounded-full blur-[80px] -mr-20 -mt-20 transition-colors duration-[2000ms] ${scanState === 'complete' ? 'bg-emerald-500/15' :
-                            scanState === 'scanning' ? 'bg-fuchsia-500/20' : 'bg-indigo-500/10'
+                        scanState === 'scanning' ? 'bg-fuchsia-500/20' : 'bg-indigo-500/10'
                         }`}
                 />
                 <motion.div
                     animate={{ ...orbFloat, transition: { ...orbFloat.transition, delay: 2 } }}
                     className={`absolute bottom-0 left-1/3 w-48 h-48 rounded-full blur-[60px] transition-colors duration-[2000ms] ${scanState === 'complete' ? 'bg-emerald-400/10' :
-                            scanState === 'scanning' ? 'bg-violet-500/15' : 'bg-transparent'
+                        scanState === 'scanning' ? 'bg-violet-500/15' : 'bg-transparent'
                         }`}
                 />
 

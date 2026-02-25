@@ -64,7 +64,7 @@ export default function AppTelemetryManager() {
                         key="error"
                         initial={{ opacity: 0 }}
                         animate={{ opacity: 1 }}
-                        className="bg-red-500/[0.07] border border-red-500/15 rounded-2xl p-6 flex items-center gap-3"
+                        className="bg-red-500/[0.07] border border-red-500/15 rounded-2xl p-6 flex items-center gap-3 select-text cursor-text"
                     >
                         <AlertTriangle className="text-red-400 h-5 w-5 flex-shrink-0" />
                         <div>

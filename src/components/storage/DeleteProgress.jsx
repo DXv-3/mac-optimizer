@@ -1,6 +1,7 @@
 import React, { useMemo, useRef, useEffect, useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Trash2, CheckCircle2, AlertTriangle, XCircle, Download } from 'lucide-react';
+import { Trash2, CheckCircle2, AlertTriangle, XCircle, Download, X } from 'lucide-react';
+import useStore from '../../store/useStore';
 
 function formatSize(bytes) {
     if (!bytes || bytes === 0) return '0 B';
@@ -13,6 +14,7 @@ function formatSize(bytes) {
 export default function DeleteProgress({ progress, log = [] }) {
     const scrollRef = useRef(null);
     const [searchQuery, setSearchQuery] = useState('');
+    const closeDeleteProgressModal = useStore(state => state.closeDeleteProgressModal);
 
     // Auto-scroll log to bottom
     useEffect(() => {
@@ -60,8 +62,8 @@ export default function DeleteProgress({ progress, log = [] }) {
 
     return (
         <motion.div
-            initial={{ opacity: 0, y: 10 }}
-            animate={{ opacity: 1, y: 0 }}
+            initial={{ opacity: 0, scale: 0.95 }}
+            animate={{ opacity: 1, scale: 1 }}
             className="bg-white/[0.03] backdrop-blur-[20px] border border-white/[0.08] rounded-2xl shadow-[inset_0_1px_1px_rgba(255,255,255,0.06),0_20px_60px_-20px_rgba(0,0,0,0.5)] overflow-hidden"
         >
             {/* Header */}
@@ -72,21 +74,31 @@ export default function DeleteProgress({ progress, log = [] }) {
                         {isActive ? 'Deleting Files...' : 'Deletion Complete'}
                     </span>
                 </div>
-                <div className="flex items-center gap-3 text-[10px]">
-                    <span className="flex items-center gap-1 text-emerald-400">
-                        <CheckCircle2 size={10} /> {stats.success}
-                    </span>
-                    {stats.skipped > 0 && (
-                        <span className="flex items-center gap-1 text-amber-400">
-                            <AlertTriangle size={10} /> {stats.skipped}
+                <div className="flex items-center gap-4">
+                    <div className="flex items-center gap-3 text-[10px]">
+                        <span className="flex items-center gap-1 text-emerald-400">
+                            <CheckCircle2 size={10} /> {stats.success}
                         </span>
+                        {stats.skipped > 0 && (
+                            <span className="flex items-center gap-1 text-amber-400">
+                                <AlertTriangle size={10} /> {stats.skipped}
+                            </span>
+                        )}
+                        {stats.failed > 0 && (
+                            <span className="flex items-center gap-1 text-red-400">
+                                <XCircle size={10} /> {stats.failed}
+                            </span>
+                        )}
+                        <span className="text-cyan-400 font-mono font-bold mr-2">{formatSize(stats.freedBytes)} freed</span>
+                    </div>
+                    {!isActive && (
+                        <button
+                            onClick={closeDeleteProgressModal}
+                            className="bg-white/[0.06] hover:bg-white/[0.1] text-zinc-300 p-1.5 rounded-md transition-colors flex items-center gap-1 text-[10px] font-medium"
+                        >
+                            <X size={12} /> Close
+                        </button>
                     )}
-                    {stats.failed > 0 && (
-                        <span className="flex items-center gap-1 text-red-400">
-                            <XCircle size={10} /> {stats.failed}
-                        </span>
-                    )}
-                    <span className="text-cyan-400 font-mono font-bold">{formatSize(stats.freedBytes)} freed</span>
                 </div>
             </div>
 
@@ -147,8 +159,8 @@ export default function DeleteProgress({ progress, log = [] }) {
                                 {entry.status === 'error' && <XCircle size={10} className="text-red-400 mt-0.5 shrink-0" />}
                                 {entry.status === 'skipped' && <AlertTriangle size={10} className="text-amber-400 mt-0.5 shrink-0" />}
                                 <span className={`truncate font-mono ${entry.status === 'success' ? 'text-zinc-400' :
-                                        entry.status === 'error' ? 'text-red-400/70' :
-                                            'text-amber-400/70'
+                                    entry.status === 'error' ? 'text-red-400/70 select-text cursor-text' :
+                                        'text-amber-400/70'
                                     }`}>
                                     {entry.path}
                                     {entry.freedBytes > 0 && (
