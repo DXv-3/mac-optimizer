@@ -1,12 +1,15 @@
 import React, { useEffect, useState, useCallback, useMemo } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { HardDrive, Download, Play, Square, Trash2, RefreshCw, CheckCircle2, Shield, ShieldCheck, Zap, Clock } from 'lucide-react';
+import { HardDrive, Download, Play, Square, Trash2, RefreshCw, CheckCircle2, Shield, ShieldCheck, Zap, Clock, Eye, FolderOpen, MoreHorizontal } from 'lucide-react';
 import useStore from '../../store/useStore';
 import SunburstChart from './SunburstChart';
+import TreemapChart from './TreemapChart';
 import ScanProgress from './ScanProgress';
 import ItemList from './ItemList';
 import SearchBar from './SearchBar';
 import DeleteConfirmModal from './DeleteConfirmModal';
+import SkippedItemsPanel from './SkippedItemsPanel';
+import DeleteProgress from './DeleteProgress';
 
 const CATEGORY_LABELS = {
     browser_cache: { name: 'Browser', color: 'cyan' },
@@ -41,6 +44,8 @@ export default function StorageAnalyzer() {
         storageSortBy, storageSortDir, storageSelectedPaths,
         storageMetrics, storageAttestation, storageWarnings,
         storageRecommendations, storageStaleProjects, storagePrediction,
+        storageSkippedItems, storageReconciliation,
+        storageDeleteProgress, storageDeleteLog,
         startStorageScan, cancelStorageScan, setStorageSearch,
         setStorageFilter, setStorageSort, toggleStoragePath,
         selectAllStoragePaths, clearStorageSelection,
@@ -49,7 +54,8 @@ export default function StorageAnalyzer() {
 
     const [showDeleteModal, setShowDeleteModal] = useState(false);
     const [sunburstZoomPath, setSunburstZoomPath] = useState(null);
-    const [sunburstView, setSunburstView] = useState('full'); // 'full' | 'cleanable'
+    const [vizMode, setVizMode] = useState('treemap'); // 'treemap' | 'sunburst'
+    const [sunburstView, setSunburstView] = useState('full');
     const [contextMenu, setContextMenu] = useState(null);
 
     // Filter and sort items
@@ -354,9 +360,9 @@ export default function StorageAnalyzer() {
                             </div>
                         </motion.div>
 
-                        {/* Two-column layout: Sunburst + List */}
+                        {/* Two-column layout: Treemap/Sunburst + List */}
                         <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4 overflow-hidden">
-                            {/* Left: Sunburst + Disk Overview */}
+                            {/* Left: Visualization + Disk Overview */}
                             <motion.div
                                 initial={{ opacity: 0, scale: 0.95 }}
                                 animate={{ opacity: 1, scale: 1 }}
@@ -373,13 +379,11 @@ export default function StorageAnalyzer() {
                                             </span>
                                         </div>
                                         <div className="h-3 rounded-full overflow-hidden bg-white/[0.04] flex">
-                                            {/* Used space (non-cleanable) */}
                                             <div
                                                 className="bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-700"
                                                 style={{ width: `${Math.max(0, ((storageDiskUsed - totalBytes) / storageDiskTotal) * 100)}%` }}
                                                 title={`Used: ${formatSize(storageDiskUsed - totalBytes)}`}
                                             />
-                                            {/* Cleanable space */}
                                             <div
                                                 className="bg-gradient-to-r from-amber-500 to-orange-400 transition-all duration-700"
                                                 style={{ width: `${(totalBytes / storageDiskTotal) * 100}%` }}
@@ -402,60 +406,72 @@ export default function StorageAnalyzer() {
                                         </div>
                                     </div>
                                 )}
-                                {/* View Toggle + Title */}
+
+                                {/* Skipped Items Panel */}
+                                <SkippedItemsPanel
+                                    items={storageSkippedItems}
+                                    reconciliation={storageReconciliation}
+                                />
+
+                                {/* Viz Toggle */}
                                 <div className="flex items-center justify-between mb-3">
                                     <div className="text-xs uppercase tracking-[0.15em] text-zinc-500 font-semibold">
-                                        {sunburstView === 'full' ? 'Full Disk Map' : 'Cleanable Items'}
+                                        {vizMode === 'treemap' ? 'Disk Map' : (sunburstView === 'full' ? 'Full Disk Map' : 'Cleanable Items')}
                                     </div>
-                                    {storageFullTree && (
-                                        <div className="flex bg-white/[0.04] rounded-lg p-0.5 text-[10px]">
-                                            <button
-                                                onClick={() => setSunburstView('full')}
-                                                className={`px-2.5 py-1 rounded-md transition-all ${sunburstView === 'full'
-                                                    ? 'bg-white/[0.1] text-white font-medium'
-                                                    : 'text-zinc-500 hover:text-zinc-300'
-                                                    }`}
-                                            >
-                                                Full Disk
-                                            </button>
-                                            <button
-                                                onClick={() => setSunburstView('cleanable')}
-                                                className={`px-2.5 py-1 rounded-md transition-all ${sunburstView === 'cleanable'
-                                                    ? 'bg-white/[0.1] text-white font-medium'
-                                                    : 'text-zinc-500 hover:text-zinc-300'
-                                                    }`}
-                                            >
-                                                Cleanable
-                                            </button>
-                                        </div>
-                                    )}
-                                </div>
-                                <div className="flex-1 min-h-0">
-                                    <SunburstChart
-                                        data={sunburstView === 'full' && storageFullTree ? storageFullTree : storageTree}
-                                        zoomPath={sunburstZoomPath}
-                                        onZoom={setSunburstZoomPath}
-                                        onItemClick={(item) => {
-                                            if (item.path) toggleStoragePath(item.path);
-                                        }}
-                                    />
+                                    <div className="flex bg-white/[0.04] rounded-lg p-0.5 text-[10px] gap-0.5">
+                                        <button
+                                            onClick={() => setVizMode('treemap')}
+                                            className={`px-2.5 py-1 rounded-md transition-all ${vizMode === 'treemap'
+                                                ? 'bg-white/[0.1] text-white font-medium'
+                                                : 'text-zinc-500 hover:text-zinc-300'}`}
+                                        >
+                                            Treemap
+                                        </button>
+                                        <button
+                                            onClick={() => setVizMode('sunburst')}
+                                            className={`px-2.5 py-1 rounded-md transition-all ${vizMode === 'sunburst'
+                                                ? 'bg-white/[0.1] text-white font-medium'
+                                                : 'text-zinc-500 hover:text-zinc-300'}`}
+                                        >
+                                            Sunburst
+                                        </button>
+                                        {vizMode === 'sunburst' && storageFullTree && (
+                                            <>
+                                                <span className="w-px h-4 self-center bg-white/[0.1]" />
+                                                <button
+                                                    onClick={() => setSunburstView(v => v === 'full' ? 'cleanable' : 'full')}
+                                                    className="px-2 py-1 rounded-md text-zinc-500 hover:text-zinc-300 transition-all"
+                                                >
+                                                    {sunburstView === 'full' ? 'Show Cleanable' : 'Show Full'}
+                                                </button>
+                                            </>
+                                        )}
+                                    </div>
                                 </div>
 
-                                {/* Disk Map Category Legend */}
-                                {sunburstView === 'full' && storageDiskMap && (
-                                    <div className="flex flex-wrap gap-x-3 gap-y-1 mt-3 pt-3 border-t border-white/[0.04]">
-                                        {Object.entries(storageDiskMap)
-                                            .sort(([, a], [, b]) => b.bytes - a.bytes)
-                                            .map(([catId, cat]) => (
-                                                <span key={catId} className="flex items-center gap-1 text-[10px] text-zinc-400">
-                                                    <span className={`w-2 h-2 rounded-full`}
-                                                        style={{ background: `var(--color-${cat.color || 'zinc'}-500, #71717a)` }} />
-                                                    {cat.name} <span className="font-mono text-zinc-600">{cat.formatted}</span>
-                                                </span>
-                                            ))
-                                        }
-                                    </div>
-                                )}
+                                {/* Visualization */}
+                                <div className="flex-1 min-h-0">
+                                    {vizMode === 'treemap' ? (
+                                        <TreemapChart
+                                            data={storageFullTree || storageTree}
+                                            onItemClick={(item) => {
+                                                if (item.path) toggleStoragePath(item.path);
+                                            }}
+                                            onContextMenu={(e, item) => {
+                                                setContextMenu({ x: e.clientX, y: e.clientY, item });
+                                            }}
+                                        />
+                                    ) : (
+                                        <SunburstChart
+                                            data={sunburstView === 'full' && storageFullTree ? storageFullTree : storageTree}
+                                            zoomPath={sunburstZoomPath}
+                                            onZoom={setSunburstZoomPath}
+                                            onItemClick={(item) => {
+                                                if (item.path) toggleStoragePath(item.path);
+                                            }}
+                                        />
+                                    )}
+                                </div>
                             </motion.div>
 
                             {/* Right: Search + Item List */}
@@ -627,6 +643,16 @@ export default function StorageAnalyzer() {
                 )}
             </AnimatePresence>
 
+            {/* Delete Progress */}
+            {(storageDeleteProgress || storageDeleteLog.length > 0) && (
+                <div className="fixed bottom-6 right-6 z-50 w-[500px] max-w-[90vw]">
+                    <DeleteProgress
+                        progress={storageDeleteProgress}
+                        log={storageDeleteLog}
+                    />
+                </div>
+            )}
+
             {/* Context Menu */}
             <AnimatePresence>
                 {contextMenu && (
@@ -634,27 +660,38 @@ export default function StorageAnalyzer() {
                         initial={{ opacity: 0, scale: 0.9 }}
                         animate={{ opacity: 1, scale: 1 }}
                         exit={{ opacity: 0, scale: 0.9 }}
+                        transition={{ duration: 0.15, ease: [0.4, 0, 0.2, 1] }}
                         style={{ position: 'fixed', left: contextMenu.x, top: contextMenu.y, zIndex: 100 }}
-                        className="bg-zinc-900/95 backdrop-blur-xl border border-white/[0.1] rounded-xl shadow-2xl overflow-hidden min-w-[200px]"
+                        className="bg-zinc-900/95 backdrop-blur-xl border border-white/[0.1] rounded-xl shadow-2xl overflow-hidden min-w-[220px]"
                     >
+                        <div className="px-3 py-2 border-b border-white/[0.06]">
+                            <div className="text-xs font-medium text-white truncate max-w-[200px]">{contextMenu.item?.name}</div>
+                            <div className="text-[10px] text-zinc-500 font-mono truncate max-w-[200px]">{contextMenu.item?.path}</div>
+                        </div>
                         <button
-                            onClick={() => { window.ipcRenderer.invoke('open-in-finder', contextMenu.item.path); setContextMenu(null); }}
-                            className="w-full text-left px-4 py-2.5 text-sm text-zinc-300 hover:bg-white/[0.06] transition-colors"
+                            onClick={() => { window.ipcRenderer?.invoke('open-in-finder', contextMenu.item.path); setContextMenu(null); }}
+                            className="w-full flex items-center gap-2.5 px-4 py-2 text-sm text-zinc-300 hover:bg-white/[0.06] transition-colors"
                         >
-                            📂 Open in Finder
+                            <FolderOpen size={14} className="text-zinc-500" /> Open in Finder
+                        </button>
+                        <button
+                            onClick={() => { window.ipcRenderer?.invoke('quick-look-file', contextMenu.item.path); setContextMenu(null); }}
+                            className="w-full flex items-center gap-2.5 px-4 py-2 text-sm text-zinc-300 hover:bg-white/[0.06] transition-colors"
+                        >
+                            <Eye size={14} className="text-zinc-500" /> Quick Look
                         </button>
                         <button
                             onClick={() => { navigator.clipboard.writeText(contextMenu.item.path); setContextMenu(null); }}
-                            className="w-full text-left px-4 py-2.5 text-sm text-zinc-300 hover:bg-white/[0.06] transition-colors"
+                            className="w-full flex items-center gap-2.5 px-4 py-2 text-sm text-zinc-300 hover:bg-white/[0.06] transition-colors"
                         >
-                            📋 Copy Path
+                            <MoreHorizontal size={14} className="text-zinc-500" /> Copy Path
                         </button>
                         <div className="border-t border-white/[0.06]" />
                         <button
                             onClick={() => { toggleStoragePath(contextMenu.item.path); setShowDeleteModal(true); setContextMenu(null); }}
-                            className="w-full text-left px-4 py-2.5 text-sm text-red-400 hover:bg-red-500/10 transition-colors"
+                            className="w-full flex items-center gap-2.5 px-4 py-2 text-sm text-red-400 hover:bg-red-500/10 transition-colors"
                         >
-                            🗑 Delete
+                            <Trash2 size={14} /> Move to Trash
                         </button>
                     </motion.div>
                 )}

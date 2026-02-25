@@ -200,6 +200,36 @@ def get_last_modified(path: str) -> str:
         return "Unknown"
 
 
+def retry_fs_op(fn, max_retries=3, initial_delay=0.1, max_delay=5.0):
+    """Retry a filesystem operation with exponential backoff.
+    
+    Args:
+        fn: callable to execute
+        max_retries: max number of retries (default 3)
+        initial_delay: initial delay in seconds (default 100ms)
+        max_delay: max delay cap in seconds (default 5s)
+    Returns: result of fn()
+    Raises: last exception if all retries fail
+    """
+    delay = initial_delay
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn()
+        except PermissionError:
+            raise  # Don't retry permission errors — they won't change
+        except FileNotFoundError:
+            raise  # File deleted during scan — skip
+        except OSError as e:
+            last_err = e
+            if attempt < max_retries:
+                time.sleep(min(delay, max_delay))
+                delay *= 2  # Exponential backoff
+            else:
+                raise
+    raise last_err
+
+
 def get_dir_size_fast(path: str) -> int:
     """Calculate directory size, skipping symlinks."""
     total = 0
@@ -220,6 +250,49 @@ def get_dir_size_fast(path: str) -> int:
 def dir_exists(path: str) -> bool:
     """Check if directory exists and is accessible."""
     return os.path.isdir(path)
+
+
+def get_permission_remediation(path: str) -> str:
+    """Suggest remediation for a permission-denied path."""
+    if "/Library/Application Support/" in path or "/Library/Caches/" in path:
+        return "Grant Full Disk Access in System Settings → Privacy & Security"
+    if path.startswith("/System") or path.startswith("/usr"):
+        return "System-protected directory — requires SIP bypass (not recommended)"
+    if "/Library/Mail/" in path:
+        return "Grant Full Disk Access for Mail data scanning"
+    if "/Library/Safari/" in path:
+        return "Grant Full Disk Access for Safari data scanning"
+    if "/Photos Library" in path:
+        return "Grant Photos Library access in System Settings → Privacy & Security → Photos"
+    return "Grant Full Disk Access in System Settings → Privacy & Security"
+
+
+def reconcile_totals(disk_map: dict) -> dict:
+    """Cross-verify reported totals against itemized breakdowns.
+    
+    Returns reconciliation report with any discrepancies.
+    """
+    cat_total = sum(c["bytes"] for c in disk_map["categories"].values())
+    disk_used = disk_map.get("disk_used", 0)
+    
+    if disk_used == 0:
+        return {"status": "ok", "mapped_pct": 0, "unmapped_bytes": 0}
+    
+    mapped_pct = (cat_total / disk_used * 100) if disk_used > 0 else 0
+    unmapped = max(0, disk_used - cat_total)
+    discrepancy_pct = (unmapped / disk_used * 100) if disk_used > 0 else 0
+    
+    return {
+        "status": "ok" if discrepancy_pct < 0.1 else "discrepancy",
+        "category_total": cat_total,
+        "category_total_formatted": format_size(cat_total),
+        "disk_used": disk_used,
+        "disk_used_formatted": format_size(disk_used),
+        "unmapped_bytes": unmapped,
+        "unmapped_formatted": format_size(unmapped),
+        "mapped_pct": round(mapped_pct, 2),
+        "discrepancy_pct": round(discrepancy_pct, 2),
+    }
 
 
 # ─── Progress Tracker ───────────────────────────────────────────────────────
@@ -248,16 +321,24 @@ class ProgressTracker:
         self.errors = {"permission": 0, "symlink": 0, "missing": 0, "other": 0}
         self.last_error = None
         self.disk_warned = False
+        # Structured skipped items for the UI
+        self.skipped_items = []
 
     @property
     def error_count(self):
         return sum(self.errors.values())
 
     def record_error(self, path: str, error: Exception):
-        """Record an error according to the error handling contract."""
+        """Record an error with structured data for the skipped items panel."""
         if isinstance(error, PermissionError):
             self.errors["permission"] += 1
             self.last_error = f"Permission denied: {path}"
+            self.skipped_items.append({
+                "path": path,
+                "error_type": "permission",
+                "message": "Access denied",
+                "remediation": get_permission_remediation(path),
+            })
         elif isinstance(error, FileNotFoundError):
             self.errors["missing"] += 1
             self.last_error = f"File vanished: {path}"
@@ -267,6 +348,12 @@ class ProgressTracker:
         else:
             self.errors["other"] += 1
             self.last_error = f"{type(error).__name__}: {path}"
+            self.skipped_items.append({
+                "path": path,
+                "error_type": "other",
+                "message": str(error),
+                "remediation": "Retry scan or check file system",
+            })
 
     def check_disk(self):
         """Check disk space every DISK_CHECK_INTERVAL items."""
@@ -2301,6 +2388,9 @@ def run_scan():
         "recommendations": recommendations,
         "timeline": timeline,
         "prediction": prediction,
+        # Permission errors + reconciliation
+        "skipped_items": tracker.skipped_items[:200],  # Cap at 200 to avoid huge payloads
+        "reconciliation": reconcile_totals(disk_map),
     })
 
 

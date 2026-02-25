@@ -162,6 +162,9 @@ const useStore = create((set, get) => ({
     storageStaleProjects: [],
     storageTimeline: [],
     storagePrediction: null,
+    storageSkippedItems: [],
+    storageReconciliation: null,
+    storageScanLog: [],
     storageSearchQuery: '',
     storageFilters: { category: 'all', riskLevel: 'all', minSize: 0 },
     storageSortBy: 'size',
@@ -189,6 +192,9 @@ const useStore = create((set, get) => ({
             storageStaleProjects: [],
             storageTimeline: [],
             storagePrediction: null,
+            storageSkippedItems: [],
+            storageReconciliation: null,
+            storageScanLog: [],
             storageSelectedPaths: new Set(),
             error: null,
         });
@@ -291,6 +297,8 @@ const useStore = create((set, get) => ({
                         storageStaleProjects: data.stale_projects || [],
                         storageTimeline: data.timeline || [],
                         storagePrediction: data.prediction || null,
+                        storageSkippedItems: data.skipped_items || [],
+                        storageReconciliation: data.reconciliation || null,
                         storageScanProgress: null,
                     });
                     break;
@@ -341,24 +349,67 @@ const useStore = create((set, get) => ({
         set({ storageSelectedPaths: new Set() });
     },
 
+    storageDeleteProgress: null,
+    storageDeleteLog: [],
+
     deleteSelectedStoragePaths: async () => {
         const paths = Array.from(get().storageSelectedPaths);
         if (paths.length === 0) return;
 
-        set({ error: null });
-        try {
-            const result = await window.ipcRenderer.invoke('execute-storage-delete', paths);
-            if (result.status === 'error') throw new Error(result.message);
+        set({
+            error: null,
+            storageDeleteProgress: { completed: 0, total: paths.length },
+            storageDeleteLog: [],
+        });
 
-            // Remove deleted items from the list
-            const deletedSet = new Set(result.deleted || []);
+        const log = [];
+        let completed = 0;
+
+        for (const filePath of paths) {
+            try {
+                const result = await window.ipcRenderer.invoke('execute-storage-delete', [filePath]);
+                completed++;
+
+                if (result.deleted && result.deleted.length > 0) {
+                    // Look up size from items
+                    const item = get().storageItems.find(i => i.path === filePath);
+                    log.push({
+                        status: 'success',
+                        path: filePath,
+                        freedBytes: item?.sizeBytes || 0,
+                        message: `Moved to Trash`,
+                    });
+                } else if (result.failed && result.failed.length > 0) {
+                    log.push({
+                        status: 'error',
+                        path: filePath,
+                        freedBytes: 0,
+                        message: result.failed[0]?.error || 'Failed',
+                    });
+                }
+            } catch (err) {
+                completed++;
+                log.push({
+                    status: 'error',
+                    path: filePath,
+                    freedBytes: 0,
+                    message: err.message,
+                });
+            }
+
             set({
-                storageItems: get().storageItems.filter(i => !deletedSet.has(i.path)),
-                storageSelectedPaths: new Set(),
+                storageDeleteProgress: { completed, total: paths.length },
+                storageDeleteLog: [...log],
             });
-        } catch (err) {
-            set({ error: err.message });
         }
+
+        // Remove successfully deleted items from the list
+        const deletedSet = new Set(log.filter(e => e.status === 'success').map(e => e.path));
+        set({
+            storageItems: get().storageItems.filter(i => !deletedSet.has(i.path)),
+            storageSelectedPaths: new Set(),
+            storageDeleteProgress: { completed: paths.length, total: paths.length },
+        });
     },
 
     exportStorageReport: async () => {

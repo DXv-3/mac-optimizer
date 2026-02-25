@@ -231,6 +231,27 @@ ipcMain.handle('open-in-finder', async (event, filePath) => {
     }
 });
 
+ipcMain.handle('open-system-prefs', async (event, url) => {
+    try {
+        const { exec: execCb } = require('child_process');
+        execCb(`open "${url}"`);
+        return { status: 'success' };
+    } catch (err) {
+        return { status: 'error', message: err.message };
+    }
+});
+
+ipcMain.handle('quick-look-file', async (event, filePath) => {
+    try {
+        const { spawn: spawnLook } = require('child_process');
+        const ql = spawnLook('qlmanage', ['-p', filePath], { detached: true, stdio: 'ignore' });
+        ql.unref();
+        return { status: 'success' };
+    } catch (err) {
+        return { status: 'error', message: err.message };
+    }
+});
+
 // ─── Storage Analyzer: Export Report ───────────────────────────────────────
 
 ipcMain.handle('export-storage-report', async (event, reportData) => {
