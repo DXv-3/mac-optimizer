@@ -206,20 +206,28 @@ function _flushRustBuffer(status = null, error = null) {
     try {
         const batch = _scanBuffer.splice(0, batchSize);
 
-        // Transform Rust FsItem format to frontend-expected format
-        const items = batch.map(item => ({
-            id: item.path,
-            name: item.path.split('/').pop() || item.path,
-            path: item.path,
-            size: item.size,
-            sizeBytes: item.size,
-            sizeFormatted: formatBytes(item.size),
-            isDirectory: item.is_dir,
-            modifiedTime: item.modified_time,
-            permissions: item.permissions,
-            isClone: item.is_clone,
-            physicalSize: item.physical_size,
-        }));
+        // Transform Python Swarm event format to frontend-expected format
+        const items = batch.map(item => {
+            // Note: Our Python script emits items natively mapped quite well already
+            // so we don't strictly need to transform the Rust FsItem fields, but we 
+            // ensure the 'id', 'name', and 'path' exist for the renderer.
+            const itemPath = item.path || '';
+            return {
+                id: itemPath,
+                name: item.name || itemPath.split('/').pop() || itemPath,
+                path: itemPath,
+                size: item.size || 0,
+                sizeBytes: item.sizeBytes || item.size || 0,
+                sizeFormatted: item.sizeFormatted || formatBytes(item.size),
+                isDirectory: item.isDirectory || false,
+                modifiedTime: item.lastUsed || item.last_accessed || '',
+                permissions: item.permissions || '',
+                isClone: item.isClone || false,
+                physicalSize: item.physicalSize || item.size || 0,
+                risk: item.risk || 'safe',
+                category: item.category || 'unknown',
+            };
+        });
 
         const payload = {
             type: 'batch',
@@ -308,9 +316,32 @@ ipcMain.on('start-storage-scan', (event, scanPath) => {
     rl.on('line', (line) => {
         if (!line) return;
         try {
-            const item = JSON.parse(line);
-            _scanBuffer.push(item);
-            if (_scanBuffer.length % 100 === 0) {
+            const parsed = JSON.parse(line);
+
+            // The Python Swarm script emits events like:
+            // {"event": "item", "path": "...", "size": ...}
+            // {"event": "progress", "bytes_scanned": ...}
+            // {"event": "complete", "metrics": {...}}
+            // {"event": "swarm_phase", "phase": "..."}
+
+            if (parsed.event === 'item' || parsed.event === 'batch') {
+                if (parsed.items) { // Batch of items
+                    _scanBuffer.push(...parsed.items);
+                } else if (parsed.path) { // Single item
+                    _scanBuffer.push(parsed);
+                }
+            } else if (parsed.event === 'progress' || parsed.event === 'swarm_phase' || parsed.event === 'agent_status') {
+                // Instantly proxy progress/status events to the UI thread (bypassing the flush loop)
+                win.webContents.send('storage-scan-progress', parsed);
+            } else if (parsed.event === 'complete') {
+                // Push the final items and wait for the loop to complete natively
+                if (parsed.items) {
+                    _scanBuffer.push(...parsed.items);
+                }
+                win.webContents.send('storage-scan-complete', parsed.metrics);
+            }
+
+            if (_scanBuffer.length > 0 && _scanBuffer.length % 100 === 0) {
                 console.log(`[Main Process] Buffer has ${_scanBuffer.length} items`);
             }
         } catch (err) {
