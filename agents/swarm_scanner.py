@@ -288,19 +288,22 @@ def agent_worker_analyzer(target_type, target_path, agent_id="Analyzer-1"):
 
 # ─── HIVE MIND (Manager) ─────────────────────────────────────────────────────
 
-def deploy_swarm():
+def deploy_swarm(target_path=None):
     """Coordinate the Explorer and Analyzer agents."""
     tracker = ProgressTracker()
     
     # Starting points for explorers
-    scan_roots = [
-        os.path.join(HOME, "Desktop"),
-        os.path.join(HOME, "Documents"),
-        os.path.join(HOME, "Downloads"),
-        os.path.join(LIBRARY, "Caches"),
-        os.path.join(LIBRARY, "Application Support"),
-        os.path.join(HOME, ".npm"),
-    ]
+    if target_path:
+        scan_roots = [target_path]
+    else:
+        scan_roots = [
+            os.path.join(HOME, "Desktop"),
+            os.path.join(HOME, "Documents"),
+            os.path.join(HOME, "Downloads"),
+            os.path.join(LIBRARY, "Caches"),
+            os.path.join(LIBRARY, "Application Support"),
+            os.path.join(HOME, ".npm"),
+        ]
     
     all_items = []
     deep_targets = []
@@ -371,11 +374,12 @@ def deploy_swarm():
 def main():
     parser = argparse.ArgumentParser(description="Mac Optimizer Swarm Intelligence Scanner")
     parser.add_argument("command", choices=["scan", "status", "daemon"], default="scan", nargs="?")
+    parser.add_argument("target_path", nargs="?", default=None, help="Optional specific path to scan")
     args = parser.parse_args()
 
     # The electron IPC bridge uses 'scan' to kick off the process
     if args.command == "scan":
-        deploy_swarm()
+        deploy_swarm(args.target_path)
     else:
         print(json.dumps({"error": "Only 'scan' is implemented in Swarm mode for now."}))
 
