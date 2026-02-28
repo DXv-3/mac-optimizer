@@ -80,7 +80,7 @@ export default function SmartCareDashboard() {
                                     onClick={runSmartScan}
                                     whileHover={{ scale: 1.03, boxShadow: '0 0 30px rgba(168, 85, 247, 0.3)' }}
                                     whileTap={{ scale: 0.97 }}
-                                    className="bg-gradient-to-r from-fuchsia-600/80 to-violet-600/80 hover:from-fuchsia-500/80 hover:to-violet-500/80 border border-white/10 text-white px-8 py-3.5 rounded-2xl font-semibold shadow-lg backdrop-blur-md transition-colors"
+                                    className="btn-animated-gradient text-white px-8 py-3.5 rounded-2xl font-bold backdrop-blur-md border-none"
                                 >
                                     Start Smart Scan
                                 </motion.button>
@@ -136,10 +136,10 @@ export default function SmartCareDashboard() {
                         {scanState === 'complete' && (
                             <motion.div
                                 key="complete"
-                                initial={{ opacity: 0, y: 20, filter: 'blur(10px)' }}
-                                animate={{ opacity: 1, y: 0, filter: 'blur(0px)' }}
-                                exit={{ opacity: 0, y: -20, filter: 'blur(10px)' }}
-                                transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
+                                initial={{ opacity: 0, y: 20, scale: 0.95, filter: 'blur(8px)' }}
+                                animate={{ opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' }}
+                                exit={{ opacity: 0, y: -20, scale: 0.95, filter: 'blur(8px)' }}
+                                transition={{ type: "spring", stiffness: 300, damping: 25 }}
                                 className="py-4"
                             >
                                 <motion.div
@@ -154,9 +154,9 @@ export default function SmartCareDashboard() {
                                 <p className="text-zinc-300 text-lg mb-8">We found <span className="text-white font-bold">{metrics.totalGb} GB</span> of safely removable data.</p>
                                 <motion.button
                                     onClick={() => setActiveTab('cleanup')}
-                                    whileHover={{ scale: 1.03, boxShadow: '0 0 30px rgba(16, 185, 129, 0.3)' }}
+                                    whileHover={{ scale: 1.03 }}
                                     whileTap={{ scale: 0.97 }}
-                                    className="bg-gradient-to-r from-emerald-600/80 to-teal-600/80 border border-emerald-500/20 text-white px-8 py-3.5 rounded-2xl font-semibold shadow-[0_0_20px_rgba(16,185,129,0.15)] transition-colors"
+                                    className="btn-animated-gradient text-white px-8 py-3.5 rounded-2xl font-bold border-none"
                                 >
                                     Review & Clean
                                 </motion.button>

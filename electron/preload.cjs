@@ -41,4 +41,27 @@ contextBridge.exposeInMainWorld('electronAPI', {
     // Full Disk Access
     checkFdaStatus: () => ipcRenderer.invoke('check-fda-status'),
     openFdaSettings: () => ipcRenderer.invoke('open-fda-settings'),
+
+    // Performance & Monitoring
+    startResourceMonitor: () => ipcRenderer.send('start-resource-monitor'),
+    stopResourceMonitor: () => ipcRenderer.send('stop-resource-monitor'),
+    onResourceMonitorTick: (callback) => {
+        ipcRenderer.on('resource-monitor-tick', (event, data) => callback(data))
+    },
+    offResourceMonitorTick: () => {
+        ipcRenderer.removeAllListeners('resource-monitor-tick')
+    },
+
+    // Anomaly Hunter AI
+    startAnomalyHunter: () => ipcRenderer.send('start-anomaly-hunter'),
+    stopAnomalyHunter: () => ipcRenderer.send('stop-anomaly-hunter'),
+    onAnomalyHunterInsights: (callback) => {
+        ipcRenderer.on('anomaly-hunter-insights', (event, data) => callback(data))
+    },
+    offAnomalyHunterInsights: () => {
+        ipcRenderer.removeAllListeners('anomaly-hunter-insights')
+    },
+
+    invokeOptimizerInfo: (command, args) => ipcRenderer.invoke('invoke-system-optimizer', command, args),
+    interrogateStorageItem: (filePath) => ipcRenderer.invoke('interrogate-storage-item', filePath),
 })

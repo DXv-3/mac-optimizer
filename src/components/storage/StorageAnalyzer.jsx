@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Activity, Shield, HardDrive, Cpu, Battery, Wifi, Usb, Zap, AlertTriangle, XCircle, CheckCircle, Trash2, X, MessageSquare, Info, FileText, ChevronRight, RefreshCw, Play, ExternalLink, ShieldCheck, Download, FolderOpen } from 'lucide-react';
+import { Activity, Shield, HardDrive, Cpu, Battery, Wifi, Zap, AlertTriangle, XCircle, CheckCircle, Trash2, X, Info, FileText, ChevronRight, RefreshCw, Play, ExternalLink, ShieldCheck, Download, FolderOpen } from 'lucide-react';
 import useStore from '../../store/useStore';
 import SunburstChart from './SunburstChart';
 import TreemapChart from './TreemapChart';
@@ -45,6 +45,9 @@ const formatSize = (bytes) => {
 export default function StorageAnalyzer() {
     const {
         storageState: globalStorageState,
+        storageScanProgress,
+        storageItems: globalStorageItems,
+        storageCategories: globalStorageCategories,
         storageSearchQuery, storageFilters,
         storageSortBy, storageSortDir, storageSelectedPaths,
         storageInterrogating,
@@ -53,20 +56,22 @@ export default function StorageAnalyzer() {
         resetInterrogation,
         storageRecommendations, storageStaleProjects, storagePrediction,
         storageDeleteProgress, storageDeleteLog,
+        storageFullTree,
+        storageScanLog,
         setStorageSearch,
         setStorageFilter, setStorageSort, toggleStoragePath,
         selectAllStoragePaths, clearStorageSelection,
         deleteSelectedStoragePaths, exportStorageReport,
         fdaStatus, fdaDismissed, openFdaSettings,
         storageSwarmStatus, storageSwarmInsights,
-        startStorageScan, dismissFdaWarning
+        startStorageScan, cancelStorageScan, dismissFdaWarning
     } = useStore();
 
     // Scan State Machine: 'idle', 'scanning', 'analyzing', 'complete', 'error'
     const [scanState, setScanState] = useState('idle');
     const [scanProgress, setScanProgress] = useState(null);
     const [scanError, setScanError] = useState(null);
-    const [scanLog, setScanLog] = useState([]);
+    // scanLog is now from global store (storageScanLog)
     const [scanStats, setScanStats] = useState({ filesProcessed: 0, bytesScanned: 0 });
     const [scanStartTime, setScanStartTime] = useState(null);
 
@@ -92,7 +97,13 @@ export default function StorageAnalyzer() {
         if (scanState !== 'scanning' && scanState !== 'analyzing') return;
 
         const interval = setInterval(() => {
-            // DO NOT copy itemsRef.current here. V8 Memory Leak for millions of items!
+            const itemCount = itemsRef.current.length;
+            const catCount = categoryMapRef.current.size;
+            if (itemCount > 0) {
+                console.log('[StorageAnalyzer] UI tick:', itemCount, 'items,', catCount, 'categories');
+            }
+            // Show first 500 items to prevent memory issues
+            setStorageItems(itemsRef.current.slice(0, 500));
             setStorageCategories(Array.from(categoryMapRef.current.keys()));
             setRenderTrigger(t => t + 1);
         }, 66);
@@ -107,117 +118,75 @@ export default function StorageAnalyzer() {
         setScanState('scanning');
         setScanProgress(null);
         setScanError(null);
-        setScanLog([]);
+        // scanLog reset is handled by store
         setScanStats({ filesProcessed: 0, bytesScanned: 0 });
         setScanStartTime(Date.now());
     }, [startStorageScan]);
 
     const cancelScan = useCallback(() => {
-        if (window.ipcRenderer) {
-            window.ipcRenderer.send('cancel-storage-scan');
-        }
+        useStore.getState().cancelStorageScan();
         setScanState('idle');
         setScanStartTime(null);
     }, []);
 
-    // IPC Listener for storage-scan-event
+    // Sync local scan state with global store state
     useEffect(() => {
-        if (!window.ipcRenderer) return;
-
-        const handleBatch = (event, payload) => {
-            if (payload.status === 'scanning') setScanState('scanning');
-            if (payload.status === 'error') {
-                setScanState('error');
-                setScanError(payload.error || 'Unknown error');
-                // Add error to log
-                setScanLog(prev => [...prev, {
-                    status: 'error',
-                    path: 'System',
-                    message: payload.error || 'Unknown error',
-                    timestamp: Date.now()
-                }]);
-                return;
+        if (globalStorageState === 'scanning' || globalStorageState === 'analyzing') {
+            setScanState(globalStorageState);
+        } else if (globalStorageState === 'complete') {
+            setScanState('complete');
+            // Sync items from global store
+            itemsRef.current = globalStorageItems;
+            setStorageItems(globalStorageItems.slice(0, 500));
+            
+            // Use global categories
+            const catMap = new Map();
+            globalStorageCategories.forEach(cat => {
+                const bytes = globalStorageItems
+                    .filter(i => i.category === cat)
+                    .reduce((sum, i) => sum + (i.sizeBytes || 0), 0);
+                catMap.set(cat, bytes);
+            });
+            categoryMapRef.current = catMap;
+            setStorageCategories(globalStorageCategories);
+            
+            // Build tree
+            const root = { name: 'Storage', children: [] };
+            for (const [cat, size] of catMap.entries()) {
+                root.children.push({ name: cat, size, children: [] });
             }
+            setStorageTree(root);
+        } else if (globalStorageState === 'idle' || globalStorageState === 'error') {
+            setScanState(globalStorageState === 'error' ? 'error' : 'idle');
+        }
+    }, [globalStorageState, globalStorageItems, globalStorageCategories]);
+    
+    // Sync scan progress from global store
+    useEffect(() => {
+        if (storageScanProgress) {
+            setScanProgress(storageScanProgress);
+            setScanStats({
+                filesProcessed: storageScanProgress.filesProcessed || 0,
+                bytesScanned: storageScanProgress.bytesScanned || 0
+            });
+        }
+    }, [storageScanProgress]);
 
-            if (payload.items && payload.items.length > 0) {
-                // Determine phase roughly based on volume
-                if (itemsRef.current.length > 50000 && scanState !== 'analyzing') {
-                    setScanState('analyzing');
-                }
-
-                let batchBytes = 0;
-                let batchCount = payload.items.length;
-
-                payload.items.forEach(item => {
-                    const bytes = item.sizeBytes || item.size || 0;
-                    batchBytes += bytes;
-
-                    // Comprehensive macOS classification
-                    let cat = 'Other';
-                    const p = item.path.toLowerCase();
-
-                    if (p.includes('/applications/') || p.endsWith('.app')) cat = 'Applications';
-                    else if (p.includes('/library/developer/') || p.includes('/node_modules/') || p.includes('/.rustup') || p.includes('/.cargo')) cat = 'Developer';
-                    else if (p.includes('/library/caches/') || p.includes('/library/logs/') || p.includes('/.npm')) cat = 'Cleanable Junk';
-                    else if (p.includes('/library/containers/com.apple.mail') || p.includes('/library/messages')) cat = 'Mail & Messages';
-                    else if (p.includes('/pictures/')) cat = 'Photos';
-                    else if (p.includes('/music/') || p.includes('/movies/') || p.endsWith('.mp3') || p.endsWith('.mp4') || p.endsWith('.mov')) cat = 'Music & Movies';
-                    else if (p.includes('/documents/') || p.includes('/desktop/') || p.includes('/downloads/')) cat = 'Documents';
-                    else if (p.includes('/library/') || p.includes('/system/') || p.includes('/private/') || p.includes('/usr/')) cat = 'System Data';
-                    else if (p.startsWith('/.') || p.includes('/hidden')) cat = 'System & Hidden';
-
-                    if (!categoryMapRef.current.has(cat)) categoryMapRef.current.set(cat, 0);
-                    categoryMapRef.current.set(cat, categoryMapRef.current.get(cat) + bytes);
-
-                    itemsRef.current.push({
-                        ...item,
-                        id: item.path,
-                        category: cat,
-                        sizeBytes: bytes,
-                        sizeFormatted: item.sizeFormatted || formatSize(bytes),
-                        risk: item.path.includes('/Library/') ? 'caution' : 'safe'
-                    });
-                });
-
-                setScanStats(prev => ({
-                    filesProcessed: prev.filesProcessed + batchCount,
-                    bytesScanned: prev.bytesScanned + batchBytes
-                }));
-
-                // Add info log entry for batch
-                setScanLog(prev => [...prev, {
-                    status: 'info',
-                    path: `Batch: ${payload.items[0]?.path?.substring(0, 50) || 'Unknown'}...`,
-                    message: `Processed ${payload.items.length} items`,
-                    timestamp: Date.now()
-                }].slice(-100));
-            }
-
-            if (payload.status === 'complete' || payload.status === 'cancelled') {
-                setScanState(payload.status === 'cancelled' ? 'idle' : 'complete');
-                setStorageItems([...itemsRef.current]);
-                setStorageCategories(Array.from(categoryMapRef.current.keys()));
-
-                // Build Tree
-                const root = { name: 'Storage', children: [] };
-                for (const [cat, size] of categoryMapRef.current.entries()) {
-                    root.children.push({ name: cat, size, children: [] });
-                }
-                setStorageTree(root);
-
-                // Add completion log entry
-                setScanLog(prev => [...prev, {
-                    status: 'success',
-                    path: 'System',
-                    message: payload.status === 'cancelled' ? 'Scan cancelled' : 'Scan complete',
-                    timestamp: Date.now()
-                }]);
-            }
-        };
-
-        window.ipcRenderer.on('storage-scan-event', handleBatch);
-        return () => window.ipcRenderer.off('storage-scan-event', handleBatch);
-    }, [scanState]); // removed scanStats dependency to prevent hook tearing
+    // Sync items from global store to refs during scanning (for live UI updates)
+    useEffect(() => {
+        if (scanState === 'scanning' && globalStorageItems.length > 0) {
+            itemsRef.current = globalStorageItems;
+            
+            // Build category map from items
+            const catMap = new Map();
+            globalStorageItems.forEach(item => {
+                const cat = item.category || 'Other';
+                const current = catMap.get(cat) || 0;
+                catMap.set(cat, current + (item.sizeBytes || 0));
+            });
+            categoryMapRef.current = catMap;
+        }
+    }, [scanState, globalStorageItems]);
 
     // Filter and sort items
     const filteredItems = useMemo(() => {
@@ -565,13 +534,13 @@ export default function StorageAnalyzer() {
                                     currentPath: storageItems.length > 0 ? storageItems[storageItems.length - 1]?.path?.substring(0, 60) + '...' : 'Scanning...',
                                     filesProcessed: scanStats.filesProcessed,
                                     bytesScanned: scanStats.bytesScanned,
-                                    scanRateMbps: scanStats.bytesScanned / ((Date.now() - scanStartTime) / 1000 + 1) / (1024 * 1024),
-                                    elapsed: Math.floor((Date.now() - scanStartTime) / 1000),
-                                    errorCount: scanLog.filter(l => l.status === 'error').length
+                                    scanRateMbps: scanStartTime ? scanStats.bytesScanned / ((Date.now() - scanStartTime) / 1000 + 1) / (1024 * 1024) : 0,
+                                    elapsed: scanStartTime ? Math.floor((Date.now() - scanStartTime) / 1000) : 0,
+                                    errorCount: (storageScanLog || []).filter(l => l && l.status === 'error').length
                                 }}
                                 items={storageItems}
                                 categories={storageCategories}
-                                log={scanLog}
+                                log={storageScanLog || []}
                             />
                         </div>
                     </motion.div>
@@ -841,13 +810,13 @@ export default function StorageAnalyzer() {
                                 <div className="space-y-3">
                                     <h4 className="text-[10px] font-bold text-zinc-500 uppercase tracking-[0.2em] px-1">Mission Telemetry Stream</h4>
                                     <div className="bg-black/40 rounded-2xl border border-white/5 font-mono text-[11px] p-4 h-[240px] overflow-y-auto custom-scrollbar leading-relaxed">
-                                        {(storageScanLog || []).filter(l => l.includes(activeAgent.id)).slice(-20).map((log, i) => (
+                                        {(storageScanLog || []).filter(l => l && l.agentId === activeAgent.id).slice(-20).map((log, i) => (
                                             <div key={i} className="mb-2 py-1 border-b border-white/[0.02] last:border-0 flex gap-3">
-                                                <span className="text-zinc-700 whitespace-nowrap">[{new Date().toLocaleTimeString([], { hour12: false })}]</span>
-                                                <span className="text-zinc-400">{log.split(':').slice(1).join(':').trim()}</span>
+                                                <span className="text-zinc-700 whitespace-nowrap">[{new Date(log.timestamp || Date.now()).toLocaleTimeString([], { hour12: false })}]</span>
+                                                <span className="text-zinc-400">{log.message || 'No message'}</span>
                                             </div>
                                         ))}
-                                        {!(storageScanLog || []).some(l => l.includes(activeAgent.id)) && (
+                                        {!(storageScanLog || []).some(l => l && l.agentId === activeAgent.id) && (
                                             <div className="h-full flex flex-col items-center justify-center text-zinc-600 italic">
                                                 <Activity size={24} className="mb-3 opacity-20" />
                                                 <p>Establishing secure channel to agent...</p>

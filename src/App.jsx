@@ -60,7 +60,6 @@ function App() {
                     background: 'rgba(10, 4, 18, 0.55)',
                     backdropFilter: 'blur(24px)',
                     WebkitBackdropFilter: 'blur(24px)',
-                    borderRight: '1px solid rgba(255,255,255,0.06)',
                     WebkitAppRegion: 'drag',
                 }}
             >
@@ -151,22 +150,21 @@ function App() {
                         background: 'rgba(255,255,255,0.04)',
                         backdropFilter: 'blur(24px)',
                         WebkitBackdropFilter: 'blur(24px)',
-                        border: '1px solid rgba(255,255,255,0.07)',
                     }}
                 >
                     {/* Error toast */}
                     <AnimatePresence>
                         {error && (
                             <motion.div
-                                initial={{ opacity: 0, y: -20 }}
-                                animate={{ opacity: 1, y: 0 }}
-                                exit={{ opacity: 0, y: -20 }}
-                                transition={transition}
-                                className="absolute top-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2.5 rounded-2xl text-sm text-red-300"
+                                initial={{ opacity: 0, y: -40, scale: 0.95 }}
+                                animate={{ opacity: 1, y: 0, scale: 1 }}
+                                exit={{ opacity: 0, y: -20, scale: 0.95 }}
+                                transition={{ type: "spring", stiffness: 400, damping: 25 }}
+                                className="absolute top-4 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 px-4 py-2.5 rounded-2xl text-sm text-red-300 shadow-xl"
                                 style={{
-                                    background: 'rgba(255,60,48,0.12)',
-                                    backdropFilter: 'blur(16px)',
-                                    border: '1px solid rgba(255,60,48,0.25)',
+                                    background: 'rgba(255,60,48,0.15)',
+                                    backdropFilter: 'blur(24px)',
+                                    border: '1px solid rgba(255,60,48,0.3)',
                                 }}
                             >
                                 <AlertTriangle size={14} className="flex-shrink-0" />

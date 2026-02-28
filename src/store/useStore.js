@@ -58,6 +58,95 @@ const useStore = create((set, get) => ({
 
     // Cleanup Module State
     cleanupData: null,
+
+    // Performance Module State
+    performanceMonitorState: 'idle', // 'idle' | 'running' | 'error'
+    performanceTopApps: [],          // [{ pid, cpu, mem, name }]
+    performanceBattery: null,        // { percent, is_charging }
+    performanceMemory: null,         // { free, active, wired, compressed, total_used }
+    performanceNetwork: null,        // { download_bytes_sec, upload_bytes_sec }
+
+    anomalyHunterState: 'idle',      // 'idle' | 'running'
+    anomalyInsights: [],             // [{ id, type, severity, message, action, pid, command }]
+
+    startPerformanceMonitor: () => {
+        if (!checkIpc(set)) return;
+
+        // Prevent duplicate listeners by removing existing ones first
+        window.electronAPI.offResourceMonitorTick?.();
+        window.electronAPI.offAnomalyHunterInsights?.();
+
+        // Set state first, then start processes
+        set({ performanceMonitorState: 'running', anomalyHunterState: 'running' });
+
+        try {
+            // Resource Monitor Base Telemetry
+            window.electronAPI.onResourceMonitorTick((data) => {
+                set({
+                    performanceTopApps: data.top_apps || [],
+                    performanceBattery: data.battery || null,
+                    performanceMemory: data.memory || null,
+                    performanceNetwork: data.network || null,
+                });
+            });
+
+            // AI Anomaly Hunter Insights
+            window.electronAPI.onAnomalyHunterInsights((newInsights) => {
+                // Merge new insights, avoiding duplicates by ID
+                set(state => {
+                    const current = [...state.anomalyInsights];
+                    for (const insight of newInsights) {
+                        if (!current.find(i => i.id === insight.id)) {
+                            current.push(insight);
+                        }
+                    }
+                    return { anomalyInsights: current };
+                });
+            });
+
+            window.electronAPI.startResourceMonitor();
+            window.electronAPI.startAnomalyHunter();
+        } catch (err) {
+            // Handle IPC failures gracefully
+            console.error('Failed to start performance monitor:', err);
+            set({ performanceMonitorState: 'error', anomalyHunterState: 'idle' });
+        }
+    },
+
+    stopPerformanceMonitor: () => {
+        if (!checkIpc(set)) return;
+
+        // Remove event listeners to prevent memory leaks
+        window.electronAPI.offResourceMonitorTick?.();
+        window.electronAPI.offAnomalyHunterInsights?.();
+
+        window.electronAPI.stopResourceMonitor();
+        window.electronAPI.stopAnomalyHunter();
+
+        set({
+            performanceMonitorState: 'idle',
+            anomalyHunterState: 'idle',
+            performanceTopApps: [],
+            performanceBattery: null,
+            performanceMemory: null,
+            performanceNetwork: null,
+            anomalyInsights: []
+        });
+    },
+
+    dismissAnomalyInsight: (insightId) => {
+        set(state => ({
+            anomalyInsights: state.anomalyInsights.filter(i => i.id !== insightId)
+        }));
+    },
+    executeOptimizerCommand: async (command, args = {}) => {
+        if (!checkIpc(set)) return { status: 'error', message: 'IPC missing' };
+        try {
+            return await window.electronAPI.invokeOptimizerInfo(command, args);
+        } catch (err) {
+            return { status: 'error', message: err.message };
+        }
+    },
     isScanningCleanup: false,
     isCleaning: false,
 
@@ -220,6 +309,8 @@ const useStore = create((set, get) => ({
     storageSortBy: 'size',
     storageSortDir: 'desc',
     storageSelectedPaths: new Set(),
+    storageInterrogating: false,
+    storageInterrogationResult: null,
     _storageListenerCleanup: null,
 
     startStorageScan: async () => {
@@ -366,6 +457,12 @@ const useStore = create((set, get) => ({
                     const prev = get().storageWarnings;
                     update.storageWarnings = [...prev, ...warnings].slice(-100);
                 }
+                
+                // Handle scan log entries
+                if (snapshot.log && snapshot.log.length > 0) {
+                    const prevLog = get().storageScanLog || [];
+                    update.storageScanLog = [...prevLog, ...snapshot.log].slice(-100);
+                }
 
                 if (agentStatusUpdates && agentStatusUpdates.length > 0) {
                     const prevStatus = get().storageSwarmStatus || {};
@@ -402,24 +499,28 @@ const useStore = create((set, get) => ({
                             recoveryNote: item.recoveryNote || item.recovery_note,
                         };
                     });
-                    update.storageState = 'complete';
-                    update.storageItems = normalizedAll;
-                    update.storageTree = buildStorageTree(normalizedAll);
-                    update.storageCategories = [...new Set(normalizedAll.map(i => i.category))];
-                    update.storageFullTree = complete.full_tree || null;
-                    update.storageDiskMap = complete.disk_map || null;
-                    update.storageDiskTotal = complete.disk_total || totals?.disk_total || 0;
-                    update.storageDiskUsed = complete.disk_used || totals?.disk_used || 0;
-                    update.storageDiskFree = complete.disk_free || totals?.disk_free || 0;
-                    update.storageMetrics = complete.metrics || null;
-                    update.storageAttestation = complete.attestation || null;
-                    update.storageRecommendations = complete.recommendations || [];
-                    update.storageStaleProjects = complete.stale_projects || [];
-                    update.storageTimeline = complete.timeline || [];
-                    update.storagePrediction = complete.prediction || null;
-                    update.storageSkippedItems = complete.skipped_items || [];
-                    update.storageReconciliation = complete.reconciliation || null;
-                    update.storageScanProgress = null;
+
+                    // Atomic update to prevent UI flickering/clearing
+                    Object.assign(update, {
+                        storageState: 'complete',
+                        storageItems: normalizedAll,
+                        storageTree: buildStorageTree(normalizedAll),
+                        storageCategories: [...new Set(normalizedAll.map(i => i.category))],
+                        storageFullTree: complete.full_tree || null,
+                        storageDiskMap: complete.disk_map || null,
+                        storageDiskTotal: complete.disk_total || totals?.disk_total || 0,
+                        storageDiskUsed: complete.disk_used || totals?.disk_used || 0,
+                        storageDiskFree: complete.disk_free || totals?.disk_free || 0,
+                        storageMetrics: complete.metrics || null,
+                        storageAttestation: complete.attestation || null,
+                        storageRecommendations: complete.recommendations || [],
+                        storageStaleProjects: complete.stale_projects || [],
+                        storageTimeline: complete.timeline || [],
+                        storagePrediction: complete.prediction || null,
+                        storageSkippedItems: complete.skipped_items || [],
+                        storageReconciliation: complete.reconciliation || null,
+                        storageScanProgress: null
+                    });
                     activeScanId = null;
                 }
 
@@ -440,6 +541,36 @@ const useStore = create((set, get) => ({
                 return;
             }
 
+            // ── Batch format from main.cjs ────────────────────────────────
+            if (snapshot.type === 'batch') {
+                const update = {};
+                
+                // Handle items
+                if (Array.isArray(snapshot.items) && snapshot.items.length > 0) {
+                    const prevItems = get().storageItems || [];
+                    update.storageItems = [...prevItems, ...snapshot.items];
+                }
+                
+                // Handle status updates
+                if (snapshot.status) {
+                    if (snapshot.status === 'scanning') {
+                        update.storageState = 'scanning';
+                    } else if (snapshot.status === 'complete') {
+                        update.storageState = 'complete';
+                        update.storageScanProgress = null;
+                    } else if (snapshot.status === 'error') {
+                        update.storageState = 'idle';
+                        update.error = snapshot.error || 'Scan failed';
+                        update.storageScanProgress = null;
+                    }
+                }
+                
+                if (Object.keys(update).length > 0) {
+                    set(update);
+                }
+                return;
+            }
+
             // ── Legacy passthrough format (fallback) ──────────────────────
             const state = get();
             const eventType = snapshot.type || snapshot.event;
@@ -454,11 +585,6 @@ const useStore = create((set, get) => ({
                             elapsed: snapshot.elapsed || 0,
                         }
                     });
-                    break;
-                case 'batch':
-                    if (Array.isArray(snapshot.items)) {
-                        set({ storageItems: [...state.storageItems, ...snapshot.items] });
-                    }
                     break;
                 case 'item':
                     set({ storageItems: [...state.storageItems, snapshot] });
@@ -594,7 +720,20 @@ const useStore = create((set, get) => ({
             storageDeleteProgress: null,
             storageDeleteLog: []
         });
-    }
+    },
+    interrogateStorageItem: async (filePath) => {
+        if (!checkIpc(set)) return;
+        set({ storageInterrogating: true, storageInterrogationResult: null });
+        try {
+            const result = await window.electronAPI.interrogateStorageItem(filePath);
+            set({ storageInterrogationResult: result });
+        } catch (err) {
+            set({ storageInterrogationResult: { status: 'error', message: err.message } });
+        } finally {
+            set({ storageInterrogating: false });
+        }
+    },
+    resetInterrogation: () => set({ storageInterrogationResult: null, storageInterrogating: false })
 }));
 
 export default useStore;

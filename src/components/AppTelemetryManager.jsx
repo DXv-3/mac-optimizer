@@ -75,9 +75,9 @@ export default function AppTelemetryManager() {
                 ) : appTelemetryData?.status === "success" ? (
                     <motion.div
                         key="results"
-                        initial={{ opacity: 0, y: 20 }}
-                        animate={{ opacity: 1, y: 0 }}
-                        transition={{ duration: 0.4 }}
+                        initial={{ opacity: 0, y: 20, scale: 0.98, filter: 'blur(8px)' }}
+                        animate={{ opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' }}
+                        transition={{ type: "spring", stiffness: 350, damping: 25 }}
                         className="flex-1 overflow-hidden flex flex-col"
                     >
                         {/* Summary */}

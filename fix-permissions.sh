@@ -4,18 +4,16 @@
 # One-shot EPERM recovery for the mac-optimizer project.
 #
 # Run this ONCE whenever you encounter EPERM errors from npm/node:
-#   chmod +x fix-permissions.sh && sudo ./fix-permissions.sh
+#   chmod +x fix-permissions.sh && ./fix-permissions.sh
 #
 # What it does:
-#   1. Resets ownership of node_modules and npm caches to the current user
-#   2. Fixes global npm prefix ownership (the #1 cause of future EPERMs)
-#   3. Verifies Node.js can now lstat node_modules cleanly
+#   1. Resets ownership of node_modules, npm caches, and .venv_builder to the current user
 # ═══════════════════════════════════════════════════════════════════════════════
 
 set -euo pipefail
 
 APP_DIR="$(cd "$(dirname "$0")" && pwd)"
-CURRENT_USER="${SUDO_USER:-$(whoami)}"
+CURRENT_USER="$(whoami)"
 CURRENT_GROUP=$(id -gn "$CURRENT_USER")
 
 echo "🔧  Fixing permissions for user: $CURRENT_USER ($CURRENT_GROUP)"
@@ -28,19 +26,24 @@ for DIR in \
     "$APP_DIR/dist" \
     "$APP_DIR/dist-electron" \
     "$APP_DIR/.npm-cache" \
+    "$APP_DIR/.venv_builder" \
     "$APP_DIR/package-lock.json"; do
     if [ -e "$DIR" ]; then
         echo "  ✅  chown $CURRENT_USER:$CURRENT_GROUP $DIR"
-        chown -R "$CURRENT_USER:$CURRENT_GROUP" "$DIR"
+        chown -R "$CURRENT_USER:$CURRENT_GROUP" "$DIR" 2>/dev/null || true
     fi
 done
 
-# ── 2. Fix user-level npm cache (~/.npm) ──────────────────────────────────────
+# ── 2. Fix user-level pip and pyinstaller caches ──────────────────────────────
 USER_HOME=$(eval echo "~$CURRENT_USER")
-if [ -d "$USER_HOME/.npm" ]; then
-    echo "  ✅  chown $CURRENT_USER:$CURRENT_GROUP $USER_HOME/.npm"
-    chown -R "$CURRENT_USER:$CURRENT_GROUP" "$USER_HOME/.npm"
-fi
+for DIR in \
+    "$USER_HOME/Library/Caches/pip" \
+    "$USER_HOME/Library/Application Support/pyinstaller"; do
+    if [ -d "$DIR" ]; then
+        echo "  ✅  chown $CURRENT_USER:$CURRENT_GROUP $DIR"
+        chown -R "$CURRENT_USER:$CURRENT_GROUP" "$DIR" 2>/dev/null || true
+    fi
+done
 
 # ── 3. Fix npm global prefix (prevents future EPERMs from global installs) ────
 NPM_PREFIX=$(su - "$CURRENT_USER" -c 'npm config get prefix' 2>/dev/null || true)

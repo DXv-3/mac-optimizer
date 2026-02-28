@@ -355,13 +355,17 @@ def deploy_swarm():
     
     emit({
         "event": "complete",
+        "items": all_items,
         "metrics": {
             "total_bytes": total_size,
             "total_formatted": format_size(total_size),
             "files_scanned": tracker.files_processed,
             "items_found": len(all_items),
             "time_seconds": round(time.monotonic() - tracker.start_time, 2)
-        }
+        },
+        "disk_total": shutil.disk_usage("/")[0],
+        "disk_used": shutil.disk_usage("/")[1],
+        "disk_free": shutil.disk_usage("/")[2]
     })
 
 def main():

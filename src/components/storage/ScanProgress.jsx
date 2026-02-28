@@ -41,10 +41,10 @@ export default function ScanProgress({ progress, items, categories, warnings = [
         if (!searchQuery) return log;
         try {
             const regex = new RegExp(searchQuery, 'i');
-            return log.filter(entry => regex.test(entry.path) || regex.test(entry.message));
+            return log.filter(entry => entry && (regex.test(entry.path || '') || regex.test(entry.message || '')));
         } catch {
             const q = searchQuery.toLowerCase();
-            return log.filter(entry => entry.path?.toLowerCase().includes(q) || entry.message?.toLowerCase().includes(q));
+            return log.filter(entry => entry && (entry.path?.toLowerCase().includes(q) || entry.message?.toLowerCase().includes(q)));
         }
     }, [log, searchQuery]);
 

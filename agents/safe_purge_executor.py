@@ -122,16 +122,25 @@ def generate_cleanup_script(target_paths):
     for path in validated_paths:
         try:
             # Get size before deletion
+            size = 0
             if os.path.isdir(path):
-                size = sum(
-                    os.path.getsize(os.path.join(dp, f))
-                    for dp, _, fnames in os.walk(path)
-                    for f in fnames
-                    if os.path.exists(os.path.join(dp, f))
-                )
-                shutil.rmtree(path)
+                try:
+                    for dp, _, fnames in os.walk(path):
+                        for f in fnames:
+                            fp = os.path.join(dp, f)
+                            try:
+                                if os.path.exists(fp) and not os.path.islink(fp):
+                                    size += os.path.getsize(fp)
+                            except (OSError, FileNotFoundError):
+                                pass
+                except (OSError, PermissionError):
+                    pass
+                shutil.rmtree(path, ignore_errors=True)
             else:
-                size = os.path.getsize(path)
+                try:
+                    size = os.path.getsize(path)
+                except (OSError, FileNotFoundError):
+                    pass
                 os.remove(path)
             deleted_count += 1
             freed_bytes += size

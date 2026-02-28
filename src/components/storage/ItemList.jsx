@@ -1,6 +1,15 @@
-import React, { useCallback, useMemo, useState } from 'react';
+import React, { useCallback, useMemo, useState, memo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { ArrowUpDown, ArrowUp, ArrowDown, FolderOpen, ExternalLink, ChevronDown, ChevronRight, CheckSquare, Square } from 'lucide-react';
+import { ArrowUpDown, ArrowUp, ArrowDown, FolderOpen, ExternalLink, ChevronDown, CheckSquare, Square } from 'lucide-react';
+
+// ───────────────────────────────────────────────────────────────────────────────
+// Selectors (extracted for stable reference, prevent unnecessary re-renders)
+// ───────────────────────────────────────────────────────────────────────────────
+const selectSelectedPaths = (state) => state.storageSelectedPaths;
+const selectStorageItems = (state) => state.storageItems;
+const selectStorageFilters = (state) => state.storageFilters;
+const selectStorageSortBy = (state) => state.storageSortBy;
+const selectStorageSortDir = (state) => state.storageSortDir;
 
 const riskBadge = (risk) => {
     const styles = {
@@ -47,9 +56,18 @@ const columns = [
     { key: 'date', label: 'Accessed', className: 'w-28 text-right hidden xl:block' },
 ];
 
-export default function ItemList({ items, selectedPaths, onTogglePath, onContextMenu, sortBy, sortDir, onSort }) {
+// Memoized SortIcon component
+const SortIcon = memo(function SortIcon({ sortBy, sortDir, colKey }) {
+    if (sortBy !== colKey) return <ArrowUpDown size={10} className="text-zinc-600 ml-1" />;
+    return sortDir === 'asc'
+        ? <ArrowUp size={10} className="text-cyan-400 ml-1" />
+        : <ArrowDown size={10} className="text-cyan-400 ml-1" />;
+});
+
+export default memo(function ItemList({ items, selectedPaths, onTogglePath, onContextMenu, sortBy, sortDir, onSort }) {
     const [collapsedCategories, setCollapsedCategories] = useState(new Set());
 
+    // ── Memoized callbacks ─────────────────────────────────────────────────────
     const handleSort = useCallback((key) => {
         if (sortBy === key) {
             if (sortDir === 'desc') onSort('size', 'desc');
@@ -59,7 +77,35 @@ export default function ItemList({ items, selectedPaths, onTogglePath, onContext
         }
     }, [sortBy, sortDir, onSort]);
 
-    // Group items by category
+    const toggleCategory = useCallback((cat) => {
+        setCollapsedCategories(prev => {
+            const next = new Set(prev);
+            if (next.has(cat)) next.delete(cat);
+            else next.add(cat);
+            return next;
+        });
+    }, []);
+
+    const toggleCategoryItems = useCallback((catItems) => {
+        const allPaths = catItems.map(i => i.path);
+        const allSelected = allPaths.every(p => selectedPaths.has(p));
+        if (allSelected) {
+            allPaths.forEach(p => {
+                if (selectedPaths.has(p)) onTogglePath(p);
+            });
+        } else {
+            allPaths.forEach(p => {
+                if (!selectedPaths.has(p)) onTogglePath(p);
+            });
+        }
+    }, [selectedPaths, onTogglePath]);
+
+    const handleOpenInFinder = useCallback((e, path) => {
+        e.stopPropagation();
+        window.ipcRenderer.invoke('open-in-finder', path);
+    }, []);
+
+    // Group items by category — memoized to prevent O(n) recalculation
     const grouped = useMemo(() => {
         const groups = {};
         let totalBytes = 0;
@@ -75,43 +121,6 @@ export default function ItemList({ items, selectedPaths, onTogglePath, onContext
             .sort(([, a], [, b]) => b.totalBytes - a.totalBytes);
         return { categories: sorted, totalBytes };
     }, [items]);
-
-    const toggleCategory = useCallback((cat) => {
-        setCollapsedCategories(prev => {
-            const next = new Set(prev);
-            if (next.has(cat)) next.delete(cat);
-            else next.add(cat);
-            return next;
-        });
-    }, []);
-
-    const toggleCategoryItems = useCallback((catItems) => {
-        const allPaths = catItems.map(i => i.path);
-        const allSelected = allPaths.every(p => selectedPaths.has(p));
-        if (allSelected) {
-            // Deselect all in this category
-            allPaths.forEach(p => {
-                if (selectedPaths.has(p)) onTogglePath(p);
-            });
-        } else {
-            // Select all in this category
-            allPaths.forEach(p => {
-                if (!selectedPaths.has(p)) onTogglePath(p);
-            });
-        }
-    }, [selectedPaths, onTogglePath]);
-
-    const SortIcon = ({ colKey }) => {
-        if (sortBy !== colKey) return <ArrowUpDown size={10} className="text-zinc-600 ml-1" />;
-        return sortDir === 'asc'
-            ? <ArrowUp size={10} className="text-cyan-400 ml-1" />
-            : <ArrowDown size={10} className="text-cyan-400 ml-1" />;
-    };
-
-    const handleOpenInFinder = useCallback((e, path) => {
-        e.stopPropagation();
-        window.ipcRenderer.invoke('open-in-finder', path);
-    }, []);
 
     if (items.length === 0) {
         return (
@@ -135,7 +144,10 @@ export default function ItemList({ items, selectedPaths, onTogglePath, onContext
                         onClick={() => handleSort(col.key)}
                         className={`${col.className} flex items-center text-[10px] uppercase tracking-[0.12em] text-zinc-500 font-semibold hover:text-zinc-300 transition-colors cursor-pointer select-none ${col.key !== 'name' ? 'justify-end' : ''}`}
                     >
-                        {col.key === 'risk' ? <span className="mx-auto flex items-center">{col.label}<SortIcon colKey={col.key} /></span> : <>{col.label}<SortIcon colKey={col.key} /></>}
+                        {col.key === 'risk'
+                            ? <span className="mx-auto flex items-center">{col.label}<SortIcon sortBy={sortBy} sortDir={sortDir} colKey={col.key} /></span>
+                            : <>{col.label}<SortIcon sortBy={sortBy} sortDir={sortDir} colKey={col.key} /></>
+                        }
                     </button>
                 ))}
                 <div className="w-8" />
@@ -169,7 +181,10 @@ export default function ItemList({ items, selectedPaths, onTogglePath, onContext
                                 </button>
 
                                 <button onClick={() => toggleCategory(category)} className="flex-1 flex items-center gap-2 min-w-0">
-                                    <motion.div animate={{ rotate: isCollapsed ? -90 : 0 }} transition={{ duration: 0.15 }}>
+                                    <motion.div
+                                        animate={{ rotate: isCollapsed ? -90 : 0 }}
+                                        transition={{ duration: 0.2, ease: 'easeOut' }}
+                                    >
                                         <ChevronDown size={12} className={colors.text} />
                                     </motion.div>
                                     <span className={`text-[10px] uppercase tracking-[0.15em] font-bold ${colors.text}`}>
@@ -184,7 +199,7 @@ export default function ItemList({ items, selectedPaths, onTogglePath, onContext
                                         <motion.div
                                             initial={{ width: 0 }}
                                             animate={{ width: `${pct}%` }}
-                                            transition={{ duration: 0.6, ease: [0.22, 1, 0.36, 1] }}
+                                            transition={{ duration: 0.25, ease: 'easeOut' }}
                                             className={`h-full rounded-full ${colors.bar} opacity-60`}
                                         />
                                     </div>
@@ -200,7 +215,7 @@ export default function ItemList({ items, selectedPaths, onTogglePath, onContext
 
                             {/* Items */}
                             <AnimatePresence>
-                                {!isCollapsed && group.items.map((item, idx) => {
+                                {!isCollapsed && group.items.map((item) => {
                                     const isSelected = selectedPaths.has(item.path);
                                     return (
                                         <motion.div
@@ -208,7 +223,7 @@ export default function ItemList({ items, selectedPaths, onTogglePath, onContext
                                             initial={{ opacity: 0, height: 0 }}
                                             animate={{ opacity: 1, height: 'auto' }}
                                             exit={{ opacity: 0, height: 0 }}
-                                            transition={{ duration: 0.15 }}
+                                            transition={{ duration: 0.2, ease: 'easeOut' }}
                                             onClick={() => onTogglePath(item.path)}
                                             onContextMenu={(e) => onContextMenu(e, item)}
                                             className={`flex items-center px-4 py-2.5 border-b border-white/[0.03] cursor-pointer transition-all hover:bg-white/[0.04] group/row ${isSelected ? 'bg-cyan-500/[0.06] border-l-2 border-l-cyan-500' : ''}`}
@@ -241,7 +256,7 @@ export default function ItemList({ items, selectedPaths, onTogglePath, onContext
                                                 <div className="w-full h-0.5 bg-white/[0.04] rounded-full mt-1 overflow-hidden">
                                                     <div
                                                         className={`h-full rounded-full ${colors.bar} opacity-40`}
-                                                        style={{ width: `${group.totalBytes > 0 ? Math.max(2, (item.sizeBytes / group.totalBytes) * 100) : 0}%` }}
+                                                        style={{ width: `${grouped.totalBytes > 0 ? Math.max(2, (item.sizeBytes / grouped.totalBytes) * 100) : 0}%` }}
                                                     />
                                                 </div>
                                             </div>
@@ -287,4 +302,4 @@ export default function ItemList({ items, selectedPaths, onTogglePath, onContext
             </div>
         </div>
     );
-}
+});

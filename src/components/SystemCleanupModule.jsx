@@ -4,10 +4,10 @@ import { Shield, CheckCircle } from 'lucide-react';
 import useStore from '../store/useStore';
 
 const cardVariants = {
-    hidden: { opacity: 0, y: 30, scale: 0.95 },
+    hidden: { opacity: 0, y: 40, scale: 0.95, filter: 'blur(10px)' },
     visible: (i) => ({
-        opacity: 1, y: 0, scale: 1,
-        transition: { delay: i * 0.08, type: 'spring', stiffness: 200, damping: 22 }
+        opacity: 1, y: 0, scale: 1, filter: 'blur(0px)',
+        transition: { delay: i * 0.06, type: "spring", stiffness: 350, damping: 25 }
     }),
     exit: { opacity: 0, scale: 0.95, transition: { duration: 0.2 } }
 };

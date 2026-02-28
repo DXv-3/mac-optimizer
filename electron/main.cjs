@@ -142,7 +142,13 @@ ipcMain.handle('execute-cleanup', async (event, targetPaths) => {
         child.stdin.write(JSON.stringify({ target_paths: targetPaths }));
         child.stdin.end();
         await new Promise((resolve) => { child.on('close', resolve); });
-        const pythonResult = JSON.parse(outputData);
+        let pythonResult;
+        try {
+            pythonResult = JSON.parse(outputData);
+        } catch (parseErr) {
+            console.error('Failed to parse Python output:', parseErr);
+            return { status: "error", message: "Invalid response from cleanup agent" };
+        }
 
         if (pythonResult.status === "success" && pythonResult.script_path) {
             const { response } = await dialog.showMessageBox(win, {
@@ -183,34 +189,54 @@ let _scanBuffer = [];
 let _flushTimer = null;
 let _scanInProgress = false;
 
+const MAX_BATCH_SIZE = 500; // Send max 500 items at a time to avoid IPC overflow
+
+// Track if a flush is currently executing to prevent overlapping intervals
+let _isFlushing = false;
+
 function _flushRustBuffer(status = null, error = null) {
     if (!win || win.isDestroyed()) return;
 
-    // Transform Rust FsItem format to frontend-expected format
-    const items = _scanBuffer.splice(0).map(item => ({
-        id: item.path,
-        name: item.path.split('/').pop() || item.path,
-        path: item.path,
-        size: item.size,
-        sizeBytes: item.size,
-        sizeFormatted: formatBytes(item.size),
-        isDirectory: item.is_dir,
-        modifiedTime: item.modified_time,
-        permissions: item.permissions,
-        isClone: item.is_clone,
-        physicalSize: item.physical_size,
-    }));
+    // Process ONLY ONE batch per flush to avoid flooding the renderer
+    // The 60fps loop will handle continuous flushing
+    const batchSize = Math.min(_scanBuffer.length, MAX_BATCH_SIZE);
+    if (batchSize === 0 && !status && !error) return;
 
-    const payload = {
-        type: 'batch',
-        items: items
-    };
+    _isFlushing = true;
+    try {
+        const batch = _scanBuffer.splice(0, batchSize);
 
-    if (status) payload.status = status;
-    if (error) payload.error = error;
+        // Transform Rust FsItem format to frontend-expected format
+        const items = batch.map(item => ({
+            id: item.path,
+            name: item.path.split('/').pop() || item.path,
+            path: item.path,
+            size: item.size,
+            sizeBytes: item.size,
+            sizeFormatted: formatBytes(item.size),
+            isDirectory: item.is_dir,
+            modifiedTime: item.modified_time,
+            permissions: item.permissions,
+            isClone: item.is_clone,
+            physicalSize: item.physical_size,
+        }));
 
-    if (payload.items.length > 0 || status || error) {
-        win.webContents.send('storage-scan-event', payload);
+        const payload = {
+            type: 'batch',
+            items: items,
+            status: status || 'scanning'
+        };
+
+        // Only send error if this is the final flush and buffer is empty
+        if (_scanBuffer.length === 0 && error) {
+            payload.error = error;
+        }
+
+        if (items.length > 0 || status || error) {
+            win.webContents.send('storage-scan-event', payload);
+        }
+    } finally {
+        _isFlushing = false;
     }
 }
 
@@ -223,31 +249,39 @@ function formatBytes(bytes) {
 }
 
 function _scheduleFlush() {
-    if (!_scanInProgress) return;
+    if (!_scanInProgress || _isFlushing) return;
 
+    const bufferBefore = _scanBuffer.length;
     _flushRustBuffer();
+    const bufferAfter = _scanBuffer.length;
 
-    // 16ms target = ~60fps
-    _flushTimer = setTimeout(_scheduleFlush, 16);
+    // Log if buffer is growing too fast
+    if (bufferBefore > 0) {
+        console.log(`[Main] Flush: ${bufferBefore}→${bufferAfter} items remaining`);
+    }
 }
 
 function _stopRustScan() {
     _scanInProgress = false;
-    if (_flushTimer) { clearTimeout(_flushTimer); _flushTimer = null; }
+    if (_flushTimer) { clearInterval(_flushTimer); _flushTimer = null; }
     if (_rustScanProcess) { try { _rustScanProcess.kill(); } catch (_) { } _rustScanProcess = null; }
     _scanBuffer = [];
 }
 
 ipcMain.on('start-storage-scan', (event, scanPath) => {
+    console.log('[Main] Start storage scan requested');
     // 1. Kill any existing scan
     _stopRustScan();
 
     // 2. Resolve paths
-    const targetPath = scanPath || '/'; // Default to root if none provided
+    const targetPath = scanPath || os.homedir(); // Default to home folder for reasonable scan times
     const binPath = path.join(process.env.APP_ROOT, 'bin', 'mac-optimizer-core');
+    console.log('[Main] Target path:', targetPath);
+    console.log('[Main] Binary path:', binPath);
+    console.log('[Main] Binary exists:', fs.existsSync(binPath));
 
     if (!fs.existsSync(binPath)) {
-        win.webContents.send('scan:batch', { status: 'error', error: 'Rust core binary not found. Please build Phase 1.' });
+        win.webContents.send('storage-scan-event', { status: 'error', error: 'Rust core binary not found. Please build Phase 1.' });
         return;
     }
 
@@ -255,12 +289,14 @@ ipcMain.on('start-storage-scan', (event, scanPath) => {
     _flushRustBuffer('scanning'); // Initial state
 
     // 3. Spawn the Rust binary
+    console.log('[Main] Spawning Rust binary...');
     _rustScanProcess = spawn(binPath, ['scan', targetPath], {
         stdio: ['ignore', 'pipe', 'pipe']
     });
+    console.log('[Main] Rust binary spawned, PID:', _rustScanProcess.pid);
 
     // 4. Start the 60fps flush loop
-    _scheduleFlush();
+    _flushTimer = setInterval(_scheduleFlush, 16);
 
     // 5. Read stdout
     const rl = readline.createInterface({ input: _rustScanProcess.stdout, crlfDelay: Infinity });
@@ -270,8 +306,11 @@ ipcMain.on('start-storage-scan', (event, scanPath) => {
         try {
             const item = JSON.parse(line);
             _scanBuffer.push(item);
-        } catch (_) {
-            // Ignore parse errors from non-NDJSON lines
+            if (_scanBuffer.length % 100 === 0) {
+                console.log(`[Main Process] Buffer has ${_scanBuffer.length} items`);
+            }
+        } catch (err) {
+            console.log('[Main Process] Parse error:', err.message, 'Line:', line.substring(0, 50));
         }
     });
 
@@ -538,7 +577,7 @@ ipcMain.handle('open-fda-settings', async () => {
             message: 'Mac Optimizer needs Full Disk Access to scan system files, caches, and logs.',
             detail: '1. Click "Open System Settings"\n2. Click the lock to make changes\n3. Check "Mac Optimizer" in the list\n4. Return to this app',
         });
-        
+
         if (response === 0) {
             await shell.openExternal(FDA_SETTINGS_URL);
             return { status: 'success' };
@@ -565,7 +604,7 @@ ipcMain.handle('request-fda-native', async () => {
             path.join(os.homedir(), 'Library', 'Safari', 'History.db'),
             path.join(os.homedir(), 'Library', 'Messages', 'chat.db'),
         ];
-        
+
         for (const testPath of testPaths) {
             try {
                 fs.accessSync(testPath, fs.constants.R_OK);
@@ -578,7 +617,7 @@ ipcMain.handle('request-fda-native', async () => {
                 // Path doesn't exist, try next
             }
         }
-        
+
         return { granted: false, error: 'No test paths available' };
     } catch (err) {
         return { granted: false, error: err.message };

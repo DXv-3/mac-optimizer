@@ -145,3 +145,103 @@
   background-size: 200% auto;
   animation: shimmer 2s linear infinite;
 }
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * Dynamic Gradient Button Effect (CodePen Inspired)
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+@keyframes gradient-shift {
+  0% {
+    background-position: 0% 50%;
+  }
+
+  50% {
+    background-position: 100% 50%;
+  }
+
+  100% {
+    background-position: 0% 50%;
+  }
+}
+
+.btn-animated-gradient {
+  background: linear-gradient(-45deg, #10b981, #3b82f6, #8b5cf6, #ec4899);
+  background-size: 300% 300%;
+  transition: all 0.3s cubic-bezier(0.25, 0.8, 0.25, 1);
+  box-shadow: 0 4px 15px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.2);
+}
+
+.btn-animated-gradient:hover {
+  animation: gradient-shift 3s ease infinite;
+  transform: translateY(-2px) scale(1.02);
+  box-shadow: 0 10px 25px rgba(139, 92, 246, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+}
+
+.btn-animated-gradient:active {
+  transform: translateY(1px) scale(0.98);
+  box-shadow: 0 2px 10px rgba(139, 92, 246, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.1);
+}
+
+/* Subtle variant for Storage tab highlights */
+.gradient-pulse-subtle {
+  background: linear-gradient(-45deg, rgba(16, 185, 129, 0.15), rgba(59, 130, 246, 0.15), rgba(139, 92, 246, 0.15));
+  background-size: 300% 300%;
+  animation: gradient-shift 6s ease infinite;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * Tabular Numbers — Monospace digits for consistent width
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+.font-tabular-nums {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: 'tnum' on, 'lnum' on;
+}
+
+/* Apply tabular-nums to size displays and numeric data */
+.size-display,
+.byte-counter,
+.scan-stats,
+.progress-metrics {
+  font-variant-numeric: tabular-nums;
+  -webkit-font-feature-settings: 'tnum';
+  font-feature-settings: 'tnum';
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════════
+ * CSS Containment — Isolate layout/paint/compositing for performance
+ * ═══════════════════════════════════════════════════════════════════════════════ */
+
+/* Strict containment for scrollable item lists */
+.contain-content {
+  contain: content;
+}
+
+/* Layout containment for categories and sections */
+.contain-layout {
+  contain: layout;
+}
+
+/* Paint containment for static elements */
+.contain-paint {
+  contain: paint;
+}
+
+/* Strict containment for heavy-render components */
+.contain-strict {
+  contain: strict;
+}
+
+/* Apply to ItemList and scrollable regions */
+.scrollable-list,
+.category-section,
+.item-row {
+  contain: content;
+}
+
+/* Apply to static panels and cards */
+.panel-static,
+.glass-card,
+.glass-panel {
+  contain: layout style;
+}
