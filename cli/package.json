@@ -1,0 +1,16 @@
+{
+    "name": "mac-optimizer-cli",
+    "version": "1.0.0",
+    "description": "CLI and TUI interface for mac-optimizer",
+    "bin": {
+        "mac-optimizer": "./bin/cli.js"
+    },
+    "scripts": {
+        "build": "cargo build --release -p mac-optimizer-tui"
+    },
+    "dependencies": {
+        "ink": "^4.4.1",
+        "react": "^18.2.0",
+        "commander": "^12.0.0"
+    }
+}

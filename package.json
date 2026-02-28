@@ -4,11 +4,11 @@
     "version": "1.0.0",
     "type": "module",
     "scripts": {
-        "dev": "npm run preflight && concurrently -k \"vite\" \"npm run electron:dev\"",
+        "dev": "concurrently -k \"vite\" \"npm run electron:dev\"",
         "electron:dev": "wait-on http://localhost:5173 && ./run-electron.sh",
-        "build": "npm run preflight && vite build && electron-builder",
+        "build": "vite build && electron-builder",
         "preview": "vite preview",
-        "fix": "sudo ./fix-permissions.sh",
+        "fix": "./fix-permissions.sh",
         "preflight": "node -e \"const f=require('fs'),p='node_modules';if(f.existsSync(p)){try{f.realpathSync(p)}catch(e){console.error('\\u274c EPERM detected! Run: npm run fix');process.exit(1)}}console.log('\\u2705 Permissions OK')\""
     },
     "dependencies": {
@@ -44,5 +44,35 @@
         "vite-plugin-electron-renderer": "^0.14.5",
         "wait-on": "^9.0.4"
     },
-    "main": "electron/main.cjs"
+    "main": "electron/main.cjs",
+    "build": {
+        "appId": "com.yourcompany.mac-optimizer",
+        "productName": "Mac Optimizer",
+        "directories": {
+            "output": "dist-electron"
+        },
+        "files": [
+            "dist/**/*",
+            "electron/**/*",
+            "bin/**/*",
+            "agents/**/*"
+        ],
+        "mac": {
+            "category": "public.app-category.utilities",
+            "target": [
+                {
+                    "target": "dmg",
+                    "arch": ["arm64", "x64"]
+                }
+            ],
+            "entitlements": "build/entitlements.mac.plist",
+            "entitlementsInherit": "build/entitlements.mac.plist",
+            "hardenedRuntime": true,
+            "gatekeeperAssess": false,
+            "asar": true
+        },
+        "dmg": {
+            "sign": false
+        }
+    }
 }

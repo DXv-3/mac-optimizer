@@ -1,6 +1,6 @@
-import React, { useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useEffect, useState, useCallback, useMemo, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { HardDrive, Download, Play, Square, Trash2, RefreshCw, CheckCircle2, Shield, ShieldCheck, Zap, Clock, Eye, FolderOpen, MoreHorizontal, AlertTriangle, ExternalLink } from 'lucide-react';
+import { Activity, Shield, HardDrive, Cpu, Battery, Wifi, Usb, Zap, AlertTriangle, XCircle, CheckCircle, Trash2, X, MessageSquare, Info, FileText, ChevronRight, RefreshCw, Play, ExternalLink, ShieldCheck, Download, FolderOpen } from 'lucide-react';
 import useStore from '../../store/useStore';
 import SunburstChart from './SunburstChart';
 import TreemapChart from './TreemapChart';
@@ -13,12 +13,17 @@ import DeleteProgress from './DeleteProgress';
 import FDAGateModal from './FDAGateModal';
 
 const CATEGORY_LABELS = {
-    browser_cache: { name: 'Browser', color: 'cyan' },
-    dev_cache: { name: 'Dev Tools', color: 'violet' },
-    app_cache: { name: 'Apps', color: 'pink' },
-    system_logs: { name: 'Logs', color: 'amber' },
-    mail_backups: { name: 'Mail/Backup', color: 'teal' },
-    general_cache: { name: 'Other', color: 'indigo' },
+    'System Data': { name: 'System Data', color: 'indigo' },
+    'Applications': { name: 'Applications', color: 'pink' },
+    'Music & Movies': { name: 'Music & Movies', color: 'amber' },
+    'Documents': { name: 'Documents', color: 'teal' },
+    'App Data': { name: 'App Data', color: 'cyan' },
+    'Developer': { name: 'Developer', color: 'violet' },
+    'Photos': { name: 'Photos', color: 'pink' },
+    'Mail & Messages': { name: 'Mail & Messages', color: 'indigo' },
+    'Cleanable Junk': { name: 'Cleanable Junk', color: 'cyan' },
+    'System & Hidden': { name: 'System & Hidden', color: 'indigo' },
+    'Other': { name: 'Other', color: 'amber' },
 };
 
 const COLOR_MAP = {
@@ -39,30 +44,180 @@ const formatSize = (bytes) => {
 
 export default function StorageAnalyzer() {
     const {
-        storageState, storageScanProgress, storageItems, storageTree,
-        storageFullTree, storageDiskMap, storageDiskTotal, storageDiskUsed, storageDiskFree,
-        storageCategories, storageSearchQuery, storageFilters,
+        storageState: globalStorageState,
+        storageSearchQuery, storageFilters,
         storageSortBy, storageSortDir, storageSelectedPaths,
-        storageMetrics, storageAttestation, storageWarnings,
+        storageInterrogating,
+        storageInterrogationResult,
+        interrogateStorageItem,
+        resetInterrogation,
         storageRecommendations, storageStaleProjects, storagePrediction,
-        storageSkippedItems, storageReconciliation,
-        storageDeleteProgress, storageDeleteLog, storageScanLog,
-        startStorageScan, cancelStorageScan, setStorageSearch,
+        storageDeleteProgress, storageDeleteLog,
+        setStorageSearch,
         setStorageFilter, setStorageSort, toggleStoragePath,
         selectAllStoragePaths, clearStorageSelection,
         deleteSelectedStoragePaths, exportStorageReport,
-        // FDA
         fdaStatus, fdaDismissed, openFdaSettings,
-
-        // SWARM Tracking (Assuming these will be added to useStore.js next)
-        storageSwarmStatus, storageSwarmInsights
+        storageSwarmStatus, storageSwarmInsights,
+        startStorageScan, dismissFdaWarning
     } = useStore();
 
+    // Scan State Machine: 'idle', 'scanning', 'analyzing', 'complete', 'error'
+    const [scanState, setScanState] = useState('idle');
+    const [scanProgress, setScanProgress] = useState(null);
+    const [scanError, setScanError] = useState(null);
+    const [scanLog, setScanLog] = useState([]);
+    const [scanStats, setScanStats] = useState({ filesProcessed: 0, bytesScanned: 0 });
+    const [scanStartTime, setScanStartTime] = useState(null);
+
+    // High-performance data accumulation refs
+    const itemsRef = useRef([]);
+    const categoryMapRef = useRef(new Map());
+
+    // Render-triggered states
+    const [renderTrigger, setRenderTrigger] = useState(0);
+    const [storageItems, setStorageItems] = useState([]);
+    const [storageTree, setStorageTree] = useState(null);
+    const [storageCategories, setStorageCategories] = useState([]);
+
     const [showDeleteModal, setShowDeleteModal] = useState(false);
+    const [activeAgent, setActiveAgent] = useState(null);
     const [sunburstZoomPath, setSunburstZoomPath] = useState(null);
-    const [vizMode, setVizMode] = useState('treemap'); // 'treemap' | 'sunburst'
+    const [vizMode, setVizMode] = useState('sunburst'); // default to sunburst
     const [sunburstView, setSunburstView] = useState('full');
     const [contextMenu, setContextMenu] = useState(null);
+
+    // 15fps Render Loop
+    useEffect(() => {
+        if (scanState !== 'scanning' && scanState !== 'analyzing') return;
+
+        const interval = setInterval(() => {
+            // DO NOT copy itemsRef.current here. V8 Memory Leak for millions of items!
+            setStorageCategories(Array.from(categoryMapRef.current.keys()));
+            setRenderTrigger(t => t + 1);
+        }, 66);
+
+        return () => clearInterval(interval);
+    }, [scanState]);
+
+    const startScan = useCallback(async () => {
+        // Use the store's FDA-checking start function
+        await startStorageScan();
+        // Sync local state with global state
+        setScanState('scanning');
+        setScanProgress(null);
+        setScanError(null);
+        setScanLog([]);
+        setScanStats({ filesProcessed: 0, bytesScanned: 0 });
+        setScanStartTime(Date.now());
+    }, [startStorageScan]);
+
+    const cancelScan = useCallback(() => {
+        if (window.ipcRenderer) {
+            window.ipcRenderer.send('cancel-storage-scan');
+        }
+        setScanState('idle');
+        setScanStartTime(null);
+    }, []);
+
+    // IPC Listener for storage-scan-event
+    useEffect(() => {
+        if (!window.ipcRenderer) return;
+
+        const handleBatch = (event, payload) => {
+            if (payload.status === 'scanning') setScanState('scanning');
+            if (payload.status === 'error') {
+                setScanState('error');
+                setScanError(payload.error || 'Unknown error');
+                // Add error to log
+                setScanLog(prev => [...prev, {
+                    status: 'error',
+                    path: 'System',
+                    message: payload.error || 'Unknown error',
+                    timestamp: Date.now()
+                }]);
+                return;
+            }
+
+            if (payload.items && payload.items.length > 0) {
+                // Determine phase roughly based on volume
+                if (itemsRef.current.length > 50000 && scanState !== 'analyzing') {
+                    setScanState('analyzing');
+                }
+
+                let batchBytes = 0;
+                let batchCount = payload.items.length;
+
+                payload.items.forEach(item => {
+                    const bytes = item.sizeBytes || item.size || 0;
+                    batchBytes += bytes;
+
+                    // Comprehensive macOS classification
+                    let cat = 'Other';
+                    const p = item.path.toLowerCase();
+
+                    if (p.includes('/applications/') || p.endsWith('.app')) cat = 'Applications';
+                    else if (p.includes('/library/developer/') || p.includes('/node_modules/') || p.includes('/.rustup') || p.includes('/.cargo')) cat = 'Developer';
+                    else if (p.includes('/library/caches/') || p.includes('/library/logs/') || p.includes('/.npm')) cat = 'Cleanable Junk';
+                    else if (p.includes('/library/containers/com.apple.mail') || p.includes('/library/messages')) cat = 'Mail & Messages';
+                    else if (p.includes('/pictures/')) cat = 'Photos';
+                    else if (p.includes('/music/') || p.includes('/movies/') || p.endsWith('.mp3') || p.endsWith('.mp4') || p.endsWith('.mov')) cat = 'Music & Movies';
+                    else if (p.includes('/documents/') || p.includes('/desktop/') || p.includes('/downloads/')) cat = 'Documents';
+                    else if (p.includes('/library/') || p.includes('/system/') || p.includes('/private/') || p.includes('/usr/')) cat = 'System Data';
+                    else if (p.startsWith('/.') || p.includes('/hidden')) cat = 'System & Hidden';
+
+                    if (!categoryMapRef.current.has(cat)) categoryMapRef.current.set(cat, 0);
+                    categoryMapRef.current.set(cat, categoryMapRef.current.get(cat) + bytes);
+
+                    itemsRef.current.push({
+                        ...item,
+                        id: item.path,
+                        category: cat,
+                        sizeBytes: bytes,
+                        sizeFormatted: item.sizeFormatted || formatSize(bytes),
+                        risk: item.path.includes('/Library/') ? 'caution' : 'safe'
+                    });
+                });
+
+                setScanStats(prev => ({
+                    filesProcessed: prev.filesProcessed + batchCount,
+                    bytesScanned: prev.bytesScanned + batchBytes
+                }));
+
+                // Add info log entry for batch
+                setScanLog(prev => [...prev, {
+                    status: 'info',
+                    path: `Batch: ${payload.items[0]?.path?.substring(0, 50) || 'Unknown'}...`,
+                    message: `Processed ${payload.items.length} items`,
+                    timestamp: Date.now()
+                }].slice(-100));
+            }
+
+            if (payload.status === 'complete' || payload.status === 'cancelled') {
+                setScanState(payload.status === 'cancelled' ? 'idle' : 'complete');
+                setStorageItems([...itemsRef.current]);
+                setStorageCategories(Array.from(categoryMapRef.current.keys()));
+
+                // Build Tree
+                const root = { name: 'Storage', children: [] };
+                for (const [cat, size] of categoryMapRef.current.entries()) {
+                    root.children.push({ name: cat, size, children: [] });
+                }
+                setStorageTree(root);
+
+                // Add completion log entry
+                setScanLog(prev => [...prev, {
+                    status: 'success',
+                    path: 'System',
+                    message: payload.status === 'cancelled' ? 'Scan cancelled' : 'Scan complete',
+                    timestamp: Date.now()
+                }]);
+            }
+        };
+
+        window.ipcRenderer.on('storage-scan-event', handleBatch);
+        return () => window.ipcRenderer.off('storage-scan-event', handleBatch);
+    }, [scanState]); // removed scanStats dependency to prevent hook tearing
 
     // Filter and sort items
     const filteredItems = useMemo(() => {
@@ -107,8 +262,7 @@ export default function StorageAnalyzer() {
         return filtered;
     }, [storageItems, storageSearchQuery, storageFilters, storageSortBy, storageSortDir]);
 
-    const totalBytes = useMemo(() =>
-        storageItems.reduce((sum, item) => sum + (item.sizeBytes || 0), 0), [storageItems]);
+    const totalBytes = scanStats.bytesScanned || 0;
 
     const selectedItems = useMemo(() =>
         storageItems.filter(item => storageSelectedPaths.has(item.path)), [storageItems, storageSelectedPaths]);
@@ -125,23 +279,21 @@ export default function StorageAnalyzer() {
     // Category breakdown for the strip
     const categoryBreakdown = useMemo(() => {
         const cats = {};
-        for (const item of storageItems) {
-            const cat = item.category || 'general_cache';
-            if (!cats[cat]) cats[cat] = { bytes: 0, count: 0 };
-            cats[cat].bytes += (item.sizeBytes || 0);
-            cats[cat].count += 1;
-        }
-        // Calculate total for percentage - cap at 100% to prevent "170% Disc Map" errors
-        const effectiveTotal = totalBytes > 0 ? totalBytes : 1;
+        let total = 0;
+        categoryMapRef.current.forEach((bytes, cat) => {
+            cats[cat] = { bytes };
+            total += bytes;
+        });
+
+        const effectiveTotal = total > 0 ? total : 1;
         return Object.entries(cats)
             .map(([id, data]) => ({
                 id,
                 ...data,
-                // Cap percentage at 100% to prevent visualization overflow
                 pct: Math.min(100, (data.bytes / effectiveTotal) * 100)
             }))
             .sort((a, b) => b.bytes - a.bytes);
-    }, [storageItems, totalBytes]);
+    }, [renderTrigger, scanState, storageCategories]);
 
     const handleContextMenu = useCallback((e, item) => {
         e.preventDefault();
@@ -180,14 +332,15 @@ export default function StorageAnalyzer() {
     }, [safeItems, selectAllStoragePaths]);
 
     return (
-        <div className="h-full flex flex-col max-w-[1400px] mx-auto pb-6 relative">
+        <div className="flex flex-col max-w-[1400px] mx-auto pb-32 relative">
             {/* FDA Gate Modal — absolute overlay, shown when storageState === 'fda_gate' */}
-            <FDAGateModal onScanReady={startStorageScan} />
-            {/* Header */}
+            <FDAGateModal onScanReady={startScan} />
+
+            {/* Header - Sticky for fluid layout */}
             <motion.div
                 initial={{ opacity: 0, y: -10 }}
                 animate={{ opacity: 1, y: 0 }}
-                className="flex justify-between items-center mb-6 shrink-0"
+                className="sticky top-0 z-40 bg-[#0d0600]/80 backdrop-blur-xl flex justify-between items-center py-6 mb-2 border-b border-white/[0.05] shadow-xl"
             >
                 <div>
                     <h2 className="text-3xl font-bold tracking-tight text-white drop-shadow-md">
@@ -198,30 +351,45 @@ export default function StorageAnalyzer() {
                     </p>
                 </div>
                 <div className="flex items-center gap-3">
-                    {storageState === 'scanning' ? (
+                    {/* FDA Debug Button - remove in production */}
+                    {process.env.NODE_ENV === 'development' && (
                         <motion.button
-                            onClick={cancelStorageScan}
+                            onClick={() => {
+                                useStore.setState({ fdaStatus: null, fdaDismissed: false, storageState: 'idle' });
+                                setScanState('idle');
+                            }}
+                            whileHover={{ scale: 1.05 }}
+                            whileTap={{ scale: 0.95 }}
+                            className="bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/20 text-amber-400 px-3 py-2 rounded-xl text-xs font-medium transition-colors"
+                            title="Reset FDA state for testing"
+                        >
+                            Reset FDA
+                        </motion.button>
+                    )}
+                    {scanState === 'scanning' || scanState === 'analyzing' ? (
+                        <motion.button
+                            onClick={cancelScan}
                             whileHover={{ scale: 1.05 }}
                             whileTap={{ scale: 0.95 }}
                             className="bg-red-500/10 hover:bg-red-500/20 border border-red-500/20 text-red-400 px-5 py-2.5 rounded-xl font-medium transition-colors backdrop-blur-md flex items-center gap-2"
                         >
-                            <Square size={14} /> Cancel
+                            <XCircle size={14} /> Cancel
                         </motion.button>
                     ) : (
                         <motion.button
-                            onClick={startStorageScan}
+                            onClick={startScan}
                             whileHover={{ scale: 1.05, boxShadow: '0 0 30px rgba(88, 166, 255, 0.2)' }}
                             whileTap={{ scale: 0.95 }}
-                            className="bg-gradient-to-r from-cyan-600/80 to-blue-600/80 hover:from-cyan-500/80 hover:to-blue-500/80 border border-cyan-500/20 text-white px-6 py-2.5 rounded-xl font-semibold shadow-lg backdrop-blur-md transition-colors flex items-center gap-2"
+                            className="btn-animated-gradient text-white px-6 py-2.5 rounded-xl font-bold border-none transition-colors flex items-center gap-2"
                         >
-                            {storageState === 'complete' ? <RefreshCw size={16} /> : <Play size={16} />}
-                            {storageState === 'complete' ? 'Rescan' : 'Start Scan'}
+                            {scanState === 'complete' ? <RefreshCw size={16} /> : <Play size={16} />}
+                            {scanState === 'complete' ? 'Rescan' : 'Start Scan'}
                         </motion.button>
                     )}
                 </div>
             </motion.div>
 
-            {/* Degraded Mode Banner — shown when FDA denied but user chose to scan anyway */}
+            {/* Degraded Mode Banner */}
             <AnimatePresence>
                 {fdaStatus === 'denied' && fdaDismissed && storageState !== 'idle' && (
                     <motion.div
@@ -249,8 +417,7 @@ export default function StorageAnalyzer() {
                                 onClick={openFdaSettings}
                                 className="flex items-center gap-1.5 text-xs text-amber-400 hover:text-amber-300 transition-colors ml-4 shrink-0"
                             >
-                                <ExternalLink size={11} />
-                                Grant Full Disk Access
+                                <ExternalLink size={11} /> Grant Access
                             </button>
                         </div>
                     </motion.div>
@@ -258,346 +425,299 @@ export default function StorageAnalyzer() {
             </AnimatePresence>
 
             <AnimatePresence mode="wait">
-                {/* Idle State — also shown during fda_gate so background content stays visible */}
-                {(storageState === 'idle' || storageState === 'fda_gate') && (
+                {/* Idle / Welcome State */}
+                {(scanState === 'idle' || scanState === 'fda_gate') && (
                     <motion.div
                         key="idle"
                         initial={{ opacity: 0, y: 20 }}
                         animate={{ opacity: 1, y: 0 }}
                         exit={{ opacity: 0, y: -20 }}
-                        className="flex-1 flex items-center justify-center"
+                        className="flex-1 flex flex-col items-center justify-center text-center py-20"
                     >
-                        <div className="text-center max-w-md">
+                        <div className="relative mb-8">
                             <motion.div
-                                animate={{ y: [0, -8, 0] }}
-                                transition={{ duration: 4, repeat: Infinity, ease: 'easeInOut' }}
-                                className="w-24 h-24 mx-auto mb-6 rounded-3xl bg-gradient-to-br from-cyan-500/20 to-blue-500/10 border border-cyan-500/20 flex items-center justify-center"
-                            >
-                                <HardDrive size={40} className="text-cyan-400" />
-                            </motion.div>
-                            <h3 className="text-2xl font-bold text-white mb-3">Ready to Analyze</h3>
-                            <p className="text-zinc-400 text-sm leading-relaxed">
-                                Scan your system to discover browser caches, dev tool artifacts,
-                                app data, system logs, and more — all visualized as an interactive,
-                                explorable map.
-                            </p>
+                                animate={{ rotate: 360 }}
+                                transition={{ duration: 20, repeat: Infinity, ease: 'linear' }}
+                                className="absolute inset-0 bg-gradient-to-br from-orange-500/20 to-amber-500/20 rounded-full blur-3xl"
+                            />
+                            <div className="relative bg-white/5 p-8 rounded-[40px] border border-white/10 shadow-2xl backdrop-blur-xl">
+                                <HardDrive size={80} className="text-orange-400 drop-shadow-lg" />
+                            </div>
                         </div>
+                        <h3 className="text-3xl font-extrabold tracking-tight text-white mb-4">
+                            Deep Disk Visualization
+                        </h3>
+                        <p className="text-zinc-400 text-lg max-w-lg mx-auto leading-relaxed mb-8">
+                            Map every byte of your disk to find hidden bloat, stale dev caches, and old building folder.
+                        </p>
                     </motion.div>
                 )}
 
                 {/* Scanning / Swarm State */}
-                {storageState === 'scanning' && (
+                {(scanState === 'scanning' || scanState === 'analyzing') && (
                     <motion.div
                         key="scanning"
                         initial={{ opacity: 0, scale: 0.98 }}
                         animate={{ opacity: 1, scale: 1 }}
                         exit={{ opacity: 0, scale: 0.98 }}
-                        className="flex-1 flex flex-col gap-4 overflow-hidden"
+                        className="flex-1 flex flex-col gap-6 py-4"
                     >
-                        {/* Swarm Intelligence Panel */}
-                        <div className="shrink-0 bg-white/[0.03] backdrop-blur-[20px] border border-cyan-500/20 rounded-[20px] p-5">
+                        {/* Swarm Status Panel */}
+                        <div className="bg-white/[0.02] border border-white/10 rounded-[32px] p-6 backdrop-blur-md shadow-2xl">
                             <h3 className="text-sm font-semibold text-cyan-400 flex items-center gap-2 mb-4">
                                 <Zap size={16} /> Swarm Intelligence Network Active
                             </h3>
-                            <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                            <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
                                 {storageSwarmStatus && Object.values(storageSwarmStatus).map(agent => (
-                                    <div key={agent.id} className="bg-white/[0.05] border border-white/[0.05] rounded-xl p-3 flex flex-col gap-2">
+                                    <motion.button
+                                        key={agent.id}
+                                        whileHover={{ scale: 1.02, backgroundColor: 'rgba(255,255,255,0.08)' }}
+                                        whileTap={{ scale: 0.98 }}
+                                        onClick={() => setActiveAgent(agent)}
+                                        className="bg-white/[0.05] border border-white/[0.05] rounded-2xl p-4 flex flex-col gap-2 text-left transition-all"
+                                    >
                                         <div className="flex justify-between items-center">
-                                            <span className={`text-xs font-bold ${agent.type === 'explorer' ? 'text-blue-400' : 'text-purple-400'}`}>
+                                            <span className={`text-[10px] uppercase tracking-widest font-black ${agent.type === 'explorer' ? 'text-blue-400' : 'text-purple-400'}`}>
                                                 {agent.id}
                                             </span>
                                             {agent.status.includes('Finished') || agent.status === 'Idle' ? (
-                                                <span className="w-2 h-2 rounded-full bg-emerald-500 shadow-[0_0_8px_#10b981]" />
+                                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_#10b981]" />
                                             ) : (
-                                                <span className="w-2 h-2 rounded-full bg-cyan-500 animate-pulse shadow-[0_0_8px_#06b6d4]" />
+                                                <span className="w-1.5 h-1.5 rounded-full bg-cyan-500 animate-pulse shadow-[0_0_8px_#06b6d4]" />
                                             )}
                                         </div>
-                                        <div className="text-[10px] text-zinc-400 truncate opacity-80" title={agent.status}>
+                                        <div className="text-[10px] text-zinc-400 line-clamp-1 opacity-70 font-mono" title={agent.status}>
                                             {agent.status}
                                         </div>
-                                    </div>
+                                    </motion.button>
                                 ))}
-                                {(!storageSwarmStatus || Object.keys(storageSwarmStatus).length === 0) && (
-                                    <div className="col-span-4 text-xs text-zinc-500 italic text-center py-2">
-                                        Deploying swarm agents...
-                                    </div>
-                                )}
                             </div>
                         </div>
 
-                        <ScanProgress
-                            progress={storageScanProgress}
-                            items={storageItems}
-                            categories={storageCategories}
-                            warnings={storageWarnings}
-                            log={storageScanLog}
-                        />
+                        {/* macOS Style Interactive Storage Bar */}
+                        <div className="mt-8 px-6 pb-2">
+                            <div className="flex justify-between items-end mb-3">
+                                <h2 className="text-xl font-medium text-white flex items-center gap-2">
+                                    <HardDrive size={20} className="text-orange-400" />
+                                    Macintosh HD
+                                </h2>
+                                <span className="font-mono text-zinc-400 text-sm">
+                                    {scanStats.filesProcessed.toLocaleString()} items indexed
+                                </span>
+                            </div>
+
+                            {/* The Bar */}
+                            <div className="h-6 w-full bg-white/5 rounded-full overflow-hidden flex shadow-inner border border-white/5">
+                                <AnimatePresence>
+                                    {categoryBreakdown.map((cat, idx) => (
+                                        <motion.div
+                                            key={cat.id}
+                                            initial={{ width: 0, opacity: 0 }}
+                                            animate={{ width: `${cat.pct}%`, opacity: 1 }}
+                                            exit={{ width: 0, opacity: 0 }}
+                                            transition={{ type: 'spring', stiffness: 200, damping: 25 }}
+                                            className={`h-full ${COLOR_MAP[CATEGORY_LABELS[cat.id]?.color || 'indigo']} border-r border-black/20`}
+                                            title={`${CATEGORY_LABELS[cat.id]?.name || cat.id}: ${formatSize(cat.bytes)}`}
+                                        />
+                                    ))}
+                                </AnimatePresence>
+                            </div>
+
+                            {/* Legend */}
+                            <div className="flex flex-wrap items-center gap-x-6 gap-y-2 mt-4 px-1">
+                                <AnimatePresence>
+                                    {categoryBreakdown.map((cat) => (
+                                        <motion.div
+                                            key={`legend-${cat.id}`}
+                                            initial={{ opacity: 0, y: 5 }}
+                                            animate={{ opacity: 1, y: 0 }}
+                                            exit={{ opacity: 0, scale: 0.9 }}
+                                            className="flex items-center gap-2 text-xs"
+                                        >
+                                            <span className={`w-2 h-2 rounded-full ${COLOR_MAP[CATEGORY_LABELS[cat.id]?.color || 'indigo'].split(' ')[0].replace('from-', 'bg-')}`} />
+                                            <span className="text-zinc-300 font-medium">{CATEGORY_LABELS[cat.id]?.name || cat.id}</span>
+                                            <span className="text-zinc-500 font-mono">{formatSize(cat.bytes)}</span>
+                                        </motion.div>
+                                    ))}
+                                </AnimatePresence>
+                            </div>
+
+                            {/* Scanning pulse indicator */}
+                            {scanState === 'scanning' && (
+                                <div className="mt-12 flex items-center justify-center gap-3 opacity-60">
+                                    <motion.div
+                                        animate={{ rotate: 360 }}
+                                        transition={{ duration: 2, repeat: Infinity, ease: 'linear' }}
+                                        className="w-5 h-5 rounded-full border-2 border-orange-500/30 border-t-orange-500"
+                                    />
+                                    <span className="text-sm font-medium text-orange-400 animate-pulse tracking-wide uppercase">
+                                        Analyzing File System...
+                                    </span>
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Scan Progress Detail Panel */}
+                        <div className="h-[400px]">
+                            <ScanProgress
+                                progress={{
+                                    phase: scanState === 'analyzing' ? 'deep' : 'fast',
+                                    currentPath: storageItems.length > 0 ? storageItems[storageItems.length - 1]?.path?.substring(0, 60) + '...' : 'Scanning...',
+                                    filesProcessed: scanStats.filesProcessed,
+                                    bytesScanned: scanStats.bytesScanned,
+                                    scanRateMbps: scanStats.bytesScanned / ((Date.now() - scanStartTime) / 1000 + 1) / (1024 * 1024),
+                                    elapsed: Math.floor((Date.now() - scanStartTime) / 1000),
+                                    errorCount: scanLog.filter(l => l.status === 'error').length
+                                }}
+                                items={storageItems}
+                                categories={storageCategories}
+                                log={scanLog}
+                            />
+                        </div>
                     </motion.div>
                 )}
 
                 {/* Complete State */}
-                {storageState === 'complete' && storageTree && (
+                {scanState === 'complete' && (
                     <motion.div
                         key="complete"
-                        initial={{ opacity: 0 }}
-                        animate={{ opacity: 1 }}
-                        exit={{ opacity: 0 }}
-                        className="flex-1 flex flex-col space-y-4 overflow-hidden"
+                        initial={{ opacity: 0, y: 20, scale: 0.95, filter: 'blur(8px)' }}
+                        animate={{ opacity: 1, y: 0, scale: 1, filter: 'blur(0px)' }}
+                        exit={{ opacity: 0, y: -20, scale: 0.95, filter: 'blur(8px)' }}
+                        transition={{ type: "spring", stiffness: 300, damping: 25 }}
+                        className="flex-1 flex flex-col space-y-8 py-4"
                     >
                         {/* Summary Bar */}
                         <motion.div
                             initial={{ opacity: 0, x: -20 }}
                             animate={{ opacity: 1, x: 0 }}
-                            className="shrink-0 bg-cyan-500/[0.07] border border-cyan-500/15 text-cyan-400 p-4 rounded-2xl backdrop-blur-xl"
+                            className="bg-cyan-500/[0.07] border border-cyan-500/15 text-cyan-400 p-6 rounded-[32px] backdrop-blur-xl shadow-lg"
                         >
-                            <div className="flex items-center justify-between mb-3">
+                            <div className="flex items-center justify-between mb-4">
                                 <div className="flex items-center">
-                                    <HardDrive className="mr-3 h-5 w-5 flex-shrink-0" />
-                                    <span className="text-sm">
+                                    <HardDrive className="mr-3 h-6 w-6 text-cyan-400" />
+                                    <span className="text-base">
                                         Found <strong>{storageItems.length}</strong> items totaling{' '}
-                                        <strong className="text-lg">{formatSize(totalBytes)}</strong>
+                                        <strong className="text-2xl ml-1">{formatSize(totalBytes)}</strong>
                                     </span>
                                 </div>
-                                <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-3">
                                     {safeItems.length > 0 && (
                                         <motion.button
                                             onClick={handleSelectAllSafe}
                                             whileHover={{ scale: 1.05 }}
                                             whileTap={{ scale: 0.95 }}
-                                            className="bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 text-emerald-400 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors"
+                                            className="bg-emerald-500/10 hover:bg-emerald-500/20 border border-emerald-500/20 text-emerald-400 px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-1.5 transition-colors"
                                         >
-                                            <Shield size={12} /> Select All Safe ({formatSize(safeTotalBytes)})
+                                            <ShieldCheck size={14} /> Select Safe ({formatSize(safeTotalBytes)})
                                         </motion.button>
                                     )}
                                     <motion.button
                                         onClick={() => exportStorageReport()}
                                         whileHover={{ scale: 1.05 }}
                                         whileTap={{ scale: 0.95 }}
-                                        className="bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] text-zinc-300 px-3 py-1.5 rounded-lg text-xs font-medium flex items-center gap-1.5"
+                                        className="bg-white/[0.06] hover:bg-white/[0.1] border border-white/[0.08] text-zinc-300 px-4 py-2 rounded-xl text-xs font-medium flex items-center gap-1.5"
                                     >
-                                        <Download size={12} /> Export
+                                        <Download size={14} /> Export
                                     </motion.button>
                                 </div>
                             </div>
 
-                            {/* Category Breakdown Bar */}
-                            <div className="flex h-2.5 rounded-full overflow-hidden bg-white/[0.04]">
+                            <div className="flex h-3 rounded-full overflow-hidden bg-white/[0.04] mb-4">
                                 {categoryBreakdown.map((cat, idx) => {
                                     const meta = CATEGORY_LABELS[cat.id] || { color: 'indigo' };
-                                    const gradientClass = COLOR_MAP[meta.color] || COLOR_MAP.indigo;
                                     return (
                                         <motion.div
                                             key={cat.id}
                                             initial={{ width: 0 }}
                                             animate={{ width: `${cat.pct}%` }}
-                                            transition={{ duration: 0.8, delay: idx * 0.08, ease: [0.22, 1, 0.36, 1] }}
-                                            className={`h-full bg-gradient-to-r ${gradientClass} ${idx > 0 ? 'border-l border-black/20' : ''}`}
-                                            title={`${meta.name || cat.id}: ${formatSize(cat.bytes)} (${cat.pct.toFixed(1)}%)`}
+                                            transition={{ duration: 0.8, delay: idx * 0.08 }}
+                                            className={`h-full bg-gradient-to-r ${COLOR_MAP[meta.color] || COLOR_MAP.indigo}`}
                                         />
                                     );
                                 })}
                             </div>
-                            {/* Category Legend */}
-                            <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2">
+
+                            <div className="flex flex-wrap gap-x-5 gap-y-2">
                                 {categoryBreakdown.map(cat => {
                                     const meta = CATEGORY_LABELS[cat.id] || { name: cat.id, color: 'indigo' };
                                     return (
                                         <button
                                             key={cat.id}
                                             onClick={() => setStorageFilter({ ...storageFilters, category: storageFilters.category === cat.id ? 'all' : cat.id })}
-                                            className={`flex items-center gap-1.5 text-[10px] transition-all cursor-pointer ${storageFilters.category === cat.id ? 'text-white font-bold' : 'text-zinc-500 hover:text-zinc-300'}`}
+                                            className={`flex items-center gap-2 text-[11px] transition-all cursor-pointer ${storageFilters.category === cat.id ? 'text-white font-bold' : 'text-zinc-500 hover:text-zinc-300'}`}
                                         >
-                                            <span className={`w-2 h-2 rounded-full bg-gradient-to-r ${COLOR_MAP[meta.color]}`} />
-                                            {meta.name} <span className="font-mono">{formatSize(cat.bytes)}</span>
+                                            <span className={`w-2.5 h-2.5 rounded-full bg-gradient-to-r ${COLOR_MAP[meta.color]}`} />
+                                            {meta.name} <span className="font-mono opacity-60 ml-1">{formatSize(cat.bytes)}</span>
                                         </button>
                                     );
                                 })}
                             </div>
-                            {/* Risk + Attestation Row */}
-                            <div className="flex items-center justify-between mt-2 pt-2 border-t border-white/[0.04]">
-                                {storageMetrics?.risk_breakdown && (
-                                    <div className="flex items-center gap-3 text-[10px]">
-                                        <span className="text-zinc-600 uppercase tracking-wider">Risk:</span>
-                                        <span className="flex items-center gap-1 text-emerald-400">
-                                            <span className="w-1.5 h-1.5 rounded-full bg-emerald-400" />
-                                            {storageMetrics.risk_breakdown.safe || 0} safe
-                                        </span>
-                                        <span className="flex items-center gap-1 text-amber-400">
-                                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
-                                            {storageMetrics.risk_breakdown.caution || 0} caution
-                                        </span>
-                                        {(storageMetrics.risk_breakdown.critical || 0) > 0 && (
-                                            <span className="flex items-center gap-1 text-red-400">
-                                                <span className="w-1.5 h-1.5 rounded-full bg-red-400" />
-                                                {storageMetrics.risk_breakdown.critical} critical
-                                            </span>
-                                        )}
-                                    </div>
-                                )}
-                                {storageAttestation && (
-                                    <div className="flex items-center gap-1.5 text-[10px] text-emerald-500/70">
-                                        <ShieldCheck size={11} />
-                                        <span>Signed ({storageAttestation.algorithm})</span>
-                                    </div>
-                                )}
-                            </div>
                         </motion.div>
 
-                        {/* Two-column layout: Treemap/Sunburst + List */}
-                        <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-4 overflow-hidden">
-                            {/* Left: Visualization + Disk Overview */}
+                        <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                             <motion.div
-                                initial={{ opacity: 0, scale: 0.95 }}
+                                initial={{ opacity: 0, scale: 0.98 }}
                                 animate={{ opacity: 1, scale: 1 }}
                                 transition={{ delay: 0.1 }}
-                                className="bg-white/[0.03] backdrop-blur-[20px] border border-white/[0.08] rounded-[20px] p-5 shadow-[inset_0_1px_1px_rgba(255,255,255,0.06)] overflow-hidden flex flex-col"
+                                className="bg-white/[0.03] backdrop-blur-[20px] border border-white/[0.08] rounded-[32px] p-8 shadow-[inset_0_1px_1px_rgba(255,255,255,0.06)] flex flex-col h-[650px] lg:sticky lg:top-[120px]"
                             >
-                                {/* Disk Usage Overview Bar */}
-                                {storageDiskTotal > 0 && (
-                                    <div className="mb-4">
-                                        <div className="flex items-center justify-between mb-1.5">
-                                            <span className="text-xs uppercase tracking-[0.15em] text-zinc-500 font-semibold">Disk Usage</span>
-                                            <span className="text-[10px] text-zinc-500">
-                                                {formatSize(storageDiskUsed)} used / {formatSize(storageDiskTotal)} total
-                                            </span>
-                                        </div>
-                                        {/* Calculate percentages with caps to prevent overflow */}
-                                        {(() => {
-                                            const usedPct = Math.min(100, Math.max(0, ((storageDiskUsed - totalBytes) / storageDiskTotal) * 100));
-                                            const cleanablePct = Math.min(100 - usedPct, Math.max(0, (totalBytes / storageDiskTotal) * 100));
-                                            const freePct = Math.min(100, Math.max(0, (storageDiskFree / storageDiskTotal) * 100));
-                                            return (
-                                                <>
-                                                    <div className="h-3 rounded-full overflow-hidden bg-white/[0.04] flex">
-                                                        <div
-                                                            className="bg-gradient-to-r from-blue-500 to-blue-400 transition-all duration-700"
-                                                            style={{ width: `${usedPct}%` }}
-                                                            title={`Used: ${formatSize(storageDiskUsed - totalBytes)}`}
-                                                        />
-                                                        <div
-                                                            className="bg-gradient-to-r from-amber-500 to-orange-400 transition-all duration-700"
-                                                            style={{ width: `${cleanablePct}%` }}
-                                                            title={`Cleanable: ${formatSize(totalBytes)}`}
-                                                        />
-                                                    </div>
-                                                    <div className="flex items-center gap-4 mt-1.5 text-[10px] text-zinc-500">
-                                                        <span className="flex items-center gap-1">
-                                                            <span className="w-2 h-2 rounded-full bg-blue-500" />
-                                                            Used ({formatSize(storageDiskUsed - totalBytes)})
-                                                        </span>
-                                                        <span className="flex items-center gap-1">
-                                                            <span className="w-2 h-2 rounded-full bg-amber-500" />
-                                                            Cleanable ({formatSize(totalBytes)})
-                                                        </span>
-                                                        <span className="flex items-center gap-1">
-                                                            <span className="w-2 h-2 rounded-full bg-white/[0.1]" />
-                                                            Free ({formatSize(storageDiskFree)})
-                                                        </span>
-                                                    </div>
-                                                </>
-                                            );
-                                        })()}
-                                    </div>
-                                )}
-
-                                {/* Reconciliation Info - Shows unmapped bytes (400GB discrepancy) */}
-                                {storageReconciliation && storageReconciliation.unmapped_bytes > 0 && (
-                                    <div className="mb-3 px-3 py-2 rounded-lg bg-amber-500/10 border border-amber-500/20">
-                                        <div className="flex items-center gap-2 text-[10px]">
-                                            <span className="w-1.5 h-1.5 rounded-full bg-amber-400" />
-                                            <span className="text-amber-400 font-medium">Unmapped Space:</span>
-                                            <span className="text-amber-300">
-                                                {storageReconciliation.unmapped_formatted} ({storageReconciliation.discrepancy_pct}%) not categorized
-                                            </span>
-                                        </div>
-                                        <div className="text-[9px] text-zinc-500 mt-1 ml-3.5">
-                                            This includes system files, APFS snapshots, and permission-protected directories
-                                        </div>
-                                    </div>
-                                )}
-
-                                {/* Skipped Items Panel */}
-                                <SkippedItemsPanel
-                                    items={storageSkippedItems}
-                                    reconciliation={storageReconciliation}
-                                />
-
-                                {/* Viz Toggle */}
-                                <div className="flex items-center justify-between mb-3">
-                                    <div className="text-xs uppercase tracking-[0.15em] text-zinc-500 font-semibold">
-                                        {vizMode === 'treemap' ? 'Disk Map' : (sunburstView === 'full' ? 'Full Disk Map' : 'Cleanable Items')}
-                                    </div>
-                                    <div className="flex bg-white/[0.04] rounded-lg p-0.5 text-[10px] gap-0.5">
-                                        <button
-                                            onClick={() => setVizMode('treemap')}
-                                            className={`px-2.5 py-1 rounded-md transition-all ${vizMode === 'treemap'
-                                                ? 'bg-white/[0.1] text-white font-medium'
-                                                : 'text-zinc-500 hover:text-zinc-300'}`}
-                                        >
-                                            Treemap
-                                        </button>
-                                        <button
-                                            onClick={() => setVizMode('sunburst')}
-                                            className={`px-2.5 py-1 rounded-md transition-all ${vizMode === 'sunburst'
-                                                ? 'bg-white/[0.1] text-white font-medium'
-                                                : 'text-zinc-500 hover:text-zinc-300'}`}
-                                        >
-                                            Sunburst
-                                        </button>
-                                        {vizMode === 'sunburst' && storageFullTree && (
-                                            <>
-                                                <span className="w-px h-4 self-center bg-white/[0.1]" />
-                                                <button
-                                                    onClick={() => setSunburstView(v => v === 'full' ? 'cleanable' : 'full')}
-                                                    className="px-2 py-1 rounded-md text-zinc-500 hover:text-zinc-300 transition-all"
-                                                >
-                                                    {sunburstView === 'full' ? 'Show Cleanable' : 'Show Full'}
-                                                </button>
-                                            </>
-                                        )}
+                                <div className="flex items-center justify-between mb-6">
+                                    <h3 className="text-xs uppercase font-bold text-zinc-500 tracking-widest">Visual Map</h3>
+                                    <div className="flex bg-white/5 rounded-[14px] p-1 text-[11px] font-medium tracking-wide">
+                                        {['sunburst', 'treemap'].map((mode) => (
+                                            <button
+                                                key={mode}
+                                                onClick={() => setVizMode(mode)}
+                                                className={`relative px-4 py-1.5 rounded-[10px] transition-colors ${vizMode === mode ? 'text-white' : 'text-zinc-500 hover:text-zinc-300'}`}
+                                            >
+                                                {vizMode === mode && (
+                                                    <motion.div
+                                                        layoutId="viz-mode-bg"
+                                                        className="absolute inset-0 bg-white/10 rounded-[10px] border border-white/10"
+                                                        transition={{ type: "spring", stiffness: 400, damping: 30 }}
+                                                    />
+                                                )}
+                                                <span className="relative z-10 capitalize">{mode}</span>
+                                            </button>
+                                        ))}
                                     </div>
                                 </div>
 
-                                {/* Visualization */}
-                                <div className="flex-1 min-h-0">
+                                <div className="flex-1 min-h-0 bg-black/10 rounded-2xl overflow-hidden">
                                     {vizMode === 'treemap' ? (
                                         <TreemapChart
                                             data={storageFullTree || storageTree}
-                                            onItemClick={(item) => {
-                                                if (item.path) toggleStoragePath(item.path);
-                                            }}
-                                            onContextMenu={(e, item) => {
-                                                setContextMenu({ x: e.clientX, y: e.clientY, item });
-                                            }}
+                                            onItemClick={(item) => item.path && toggleStoragePath(item.path)}
+                                            onContextMenu={(e, item) => setContextMenu({ x: e.clientX, y: e.clientY, item })}
                                         />
                                     ) : (
                                         <SunburstChart
                                             data={sunburstView === 'full' && storageFullTree ? storageFullTree : storageTree}
                                             zoomPath={sunburstZoomPath}
                                             onZoom={setSunburstZoomPath}
-                                            onItemClick={(item) => {
-                                                if (item.path) toggleStoragePath(item.path);
-                                            }}
+                                            onItemClick={(item) => item.path && toggleStoragePath(item.path)}
                                         />
                                     )}
                                 </div>
                             </motion.div>
 
-                            {/* Right: Search + Item List */}
                             <motion.div
-                                initial={{ opacity: 0, scale: 0.95 }}
+                                initial={{ opacity: 0, scale: 0.98 }}
                                 animate={{ opacity: 1, scale: 1 }}
                                 transition={{ delay: 0.2 }}
-                                className="flex flex-col overflow-hidden"
+                                className="flex flex-col space-y-4"
                             >
-                                <SearchBar
-                                    query={storageSearchQuery}
-                                    onQueryChange={setStorageSearch}
-                                    filters={storageFilters}
-                                    onFilterChange={setStorageFilter}
-                                    categories={storageCategories}
-                                />
-                                <div className="flex-1 mt-3 overflow-hidden">
+                                <div className="bg-white/[0.03] border border-white/10 rounded-[32px] p-6 backdrop-blur-md">
+                                    <SearchBar
+                                        query={storageSearchQuery}
+                                        onQueryChange={setStorageSearch}
+                                        filters={storageFilters}
+                                        onFilterChange={setStorageFilter}
+                                        categories={storageCategories}
+                                    />
+                                </div>
+                                <div className="bg-white/[0.03] border border-white/10 rounded-[32px] overflow-hidden p-2">
                                     <ItemList
                                         items={filteredItems}
                                         selectedPaths={storageSelectedPaths}
@@ -616,150 +736,131 @@ export default function StorageAnalyzer() {
                             <motion.div
                                 initial={{ opacity: 0, y: 10 }}
                                 animate={{ opacity: 1, y: 0 }}
-                                transition={{ delay: 0.3 }}
-                                className="shrink-0 bg-white/[0.02] backdrop-blur-[20px] border border-white/[0.06] rounded-[20px] p-5 max-h-[260px] overflow-y-auto"
+                                className="bg-white/[0.02] border border-white/[0.06] rounded-[32px] p-8"
                             >
-                                <div className="text-xs uppercase tracking-[0.15em] text-zinc-500 font-semibold mb-3 flex items-center gap-2">
-                                    <Zap size={12} className="text-amber-400" />
-                                    Agent Insights
+                                <div className="text-xs uppercase tracking-[0.2em] text-zinc-500 font-black mb-6 flex items-center gap-2">
+                                    <Zap size={14} className="text-amber-400" />
+                                    Swarm Intelligence Insights
                                 </div>
-
-                                {/* Prediction Banner */}
-                                {storagePrediction && storagePrediction.days_until_full < 90 && (
-                                    <div className="flex items-center gap-3 p-3 mb-3 rounded-xl bg-red-500/10 border border-red-500/20">
-                                        <Clock size={16} className="text-red-400 shrink-0" />
-                                        <div className="text-xs text-red-300">
-                                            At current growth ({storagePrediction.growth_rate_formatted}),
-                                            disk will be full in <strong className="text-red-200">{storagePrediction.days_until_full} days</strong>.
-                                        </div>
-                                    </div>
-                                )}
-
-                                {/* Swarm Deep Insights (Duplicates, Large Media, etc.) */}
-                                {storageSwarmInsights && storageSwarmInsights.length > 0 && (
-                                    <div className="mb-3">
-                                        <div className="text-[10px] uppercase tracking-wider text-purple-400 mb-1.5 flex items-center gap-1.5">
-                                            <Shield size={10} /> Deep Analysis Alerts
-                                        </div>
-                                        <div className="space-y-1">
-                                            {storageSwarmInsights.map((insight, idx) => (
-                                                <div key={idx} className="flex items-center justify-between p-2 rounded-lg bg-purple-500/10 border border-purple-500/20 hover:bg-purple-500/20 transition-colors">
-                                                    <div className="flex items-center gap-2 min-w-0">
-                                                        <span className="w-1.5 h-1.5 rounded-full bg-purple-400 shrink-0" />
-                                                        <span className="text-xs text-purple-100 truncate">{insight.project_name || insight.message}</span>
-                                                    </div>
-                                                    <span className="text-[10px] font-mono text-purple-300 shrink-0">
-                                                        {insight.reclaimable_formatted}
-                                                    </span>
-                                                </div>
-                                            ))}
-                                        </div>
-                                    </div>
-                                )}
-
-                                {/* Stale Projects */}
-                                {storageStaleProjects.length > 0 && (
-                                    <div className="mb-3">
-                                        <div className="text-[10px] uppercase tracking-wider text-zinc-600 mb-1.5">Stale Dev Projects</div>
-                                        <div className="space-y-1">
-                                            {storageStaleProjects.slice(0, 5).map((proj, idx) => (
-                                                <div key={idx} className="flex items-center justify-between p-2 rounded-lg bg-white/[0.02] hover:bg-white/[0.04] transition-colors">
-                                                    <div className="flex items-center gap-2 min-w-0">
-                                                        <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 shrink-0" />
-                                                        <span className="text-xs text-zinc-300 truncate">{proj.name}</span>
-                                                        <span className="text-[10px] text-zinc-600">{proj.days_stale}d stale</span>
-                                                    </div>
-                                                    <span className="text-[10px] font-mono text-amber-400 shrink-0">
-                                                        {proj.reclaimable_formatted}
-                                                    </span>
-                                                </div>
-                                            ))}
-                                        </div>
-                                    </div>
-                                )}
-
-                                {/* Recommendations */}
-                                <div className="space-y-1.5">
-                                    {storageRecommendations.slice(0, 6).map((rec, idx) => {
-                                        const priorityColors = {
-                                            urgent: 'bg-red-500/20 text-red-300 border-red-500/30',
-                                            quick_wins: 'bg-green-500/10 text-green-300 border-green-500/20',
-                                            dev_cleanup: 'bg-cyan-500/10 text-cyan-300 border-cyan-500/20',
-                                            maintenance: 'bg-zinc-500/10 text-zinc-300 border-zinc-500/20',
-                                        };
-                                        const colorClass = priorityColors[rec.category] || priorityColors.maintenance;
-                                        return (
-                                            <div key={rec.id || idx}
-                                                className={`flex items-center justify-between p-2.5 rounded-xl border transition-colors hover:bg-white/[0.02] ${colorClass}`}
-                                            >
-                                                <div className="min-w-0 flex-1">
-                                                    <div className="text-xs font-medium truncate">{rec.title}</div>
-                                                    <div className="text-[10px] opacity-60 truncate mt-0.5">{rec.description}</div>
-                                                </div>
-                                                <div className="flex items-center gap-2 shrink-0 ml-3">
-                                                    <span className="text-xs font-mono font-semibold">
-                                                        {rec.impact_formatted}
-                                                    </span>
-                                                    <button
-                                                        onClick={() => {
-                                                            rec.items?.forEach(p => {
-                                                                if (!storageSelectedPaths.has(p)) toggleStoragePath(p);
-                                                            });
-                                                        }}
-                                                        className="text-[10px] px-2 py-0.5 rounded-md bg-white/[0.06] hover:bg-white/[0.12] text-zinc-300 transition-colors"
-                                                    >
-                                                        Select
-                                                    </button>
-                                                </div>
+                                <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
+                                    {storagePrediction && (
+                                        <div className="p-4 rounded-2xl bg-red-500/5 border border-red-500/10">
+                                            <div className="text-[10px] text-red-400 uppercase font-black mb-1">Space Alert</div>
+                                            <div className="text-sm text-zinc-300">
+                                                Disk full in <span className="text-white font-bold">{storagePrediction.days_until_full} days</span> at current growth.
                                             </div>
-                                        );
-                                    })}
+                                        </div>
+                                    )}
                                 </div>
                             </motion.div>
                         )}
-
-                        {/* Bottom Action Bar */}
-                        <AnimatePresence>
-                            {storageSelectedPaths.size > 0 && (
-                                <motion.div
-                                    initial={{ opacity: 0, y: 20 }}
-                                    animate={{ opacity: 1, y: 0 }}
-                                    exit={{ opacity: 0, y: 20 }}
-                                    className="shrink-0 flex items-center justify-between bg-white/[0.04] backdrop-blur-xl border border-white/[0.1] rounded-2xl px-5 py-3"
-                                >
-                                    <div className="flex items-center gap-3">
-                                        <CheckCircle2 size={16} className="text-cyan-400" />
-                                        <div className="text-sm text-zinc-400">
-                                            <strong className="text-white">{storageSelectedPaths.size}</strong> items selected
-                                            <span className="text-cyan-400 font-bold ml-1.5">({formatSize(selectedTotalSize)})</span>
-                                        </div>
-                                    </div>
-                                    <div className="flex items-center gap-2">
-                                        <motion.button
-                                            onClick={clearStorageSelection}
-                                            whileHover={{ scale: 1.05 }}
-                                            whileTap={{ scale: 0.95 }}
-                                            className="bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.08] text-zinc-400 px-4 py-2 rounded-xl text-sm font-medium"
-                                        >
-                                            Clear
-                                        </motion.button>
-                                        <motion.button
-                                            onClick={() => setShowDeleteModal(true)}
-                                            whileHover={{ scale: 1.03, boxShadow: '0 0 30px rgba(239, 68, 68, 0.2)' }}
-                                            whileTap={{ scale: 0.97 }}
-                                            className="bg-gradient-to-r from-red-600/80 to-rose-600/80 hover:from-red-500 hover:to-rose-500 border border-red-500/20 text-white px-5 py-2 rounded-xl font-semibold shadow-[0_0_15px_rgba(239,68,68,0.15)] flex items-center gap-2 text-sm"
-                                        >
-                                            <Trash2 size={14} /> Delete Selected
-                                        </motion.button>
-                                    </div>
-                                </motion.div>
-                            )}
-                        </AnimatePresence>
                     </motion.div>
                 )}
             </AnimatePresence>
 
-            {/* Delete Confirmation Modal */}
+            {/* Float Action Bar */}
+            <AnimatePresence>
+                {storageSelectedPaths.size > 0 && (
+                    <motion.div
+                        initial={{ y: 100, opacity: 0 }}
+                        animate={{ y: 0, opacity: 1 }}
+                        exit={{ y: 100, opacity: 0 }}
+                        className="fixed bottom-8 left-1/2 -translate-x-1/2 z-[50] flex items-center gap-6 px-8 py-5 rounded-[40px] bg-[#1a1a1a]/95 border border-white/10 shadow-2xl backdrop-blur-2xl"
+                    >
+                        <div className="flex flex-col">
+                            <span className="text-[10px] uppercase tracking-widest text-zinc-500 font-bold">Selected</span>
+                            <span className="text-base font-black text-white">
+                                {storageSelectedPaths.size} items <span className="text-zinc-500 ml-1 font-normal opacity-60">({formatSize(selectedTotalSize)})</span>
+                            </span>
+                        </div>
+                        <div className="h-8 w-px bg-white/10" />
+                        <div className="flex items-center gap-3">
+                            <button
+                                onClick={clearStorageSelection}
+                                className="px-5 py-2.5 rounded-2xl text-xs font-bold text-zinc-400 hover:text-white transition-colors"
+                            >
+                                Deselect
+                            </button>
+                            <motion.button
+                                onClick={() => setShowDeleteModal(true)}
+                                whileHover={{ scale: 1.05 }}
+                                whileTap={{ scale: 0.95 }}
+                                className="btn-animated-gradient px-8 py-3 rounded-2xl text-sm font-black text-white shadow-lg flex items-center gap-2"
+                            >
+                                <Trash2 size={18} /> Delete Selected
+                            </motion.button>
+                        </div>
+                    </motion.div>
+                )}
+            </AnimatePresence>
+
+            {/* Agent Brain Modal */}
+            <AnimatePresence>
+                {activeAgent && (
+                    <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
+                        <motion.div
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            exit={{ opacity: 0 }}
+                            onClick={() => setActiveAgent(null)}
+                            className="absolute inset-0 bg-black/80 backdrop-blur-md"
+                        />
+                        <motion.div
+                            initial={{ opacity: 0, scale: 0.9, y: 20 }}
+                            animate={{ opacity: 1, scale: 1, y: 0 }}
+                            exit={{ opacity: 0, scale: 0.9, y: 20 }}
+                            className="relative w-full max-w-2xl bg-[#121212] border border-white/10 rounded-[32px] overflow-hidden shadow-2xl flex flex-col max-h-[85vh]"
+                        >
+                            <div className="p-6 flex items-center justify-between border-b border-white/5 bg-white/[0.02]">
+                                <div className="flex items-center gap-4">
+                                    <div className={`p-4 rounded-2xl ${activeAgent.type === 'explorer' ? 'bg-blue-500/10 text-blue-400' : 'bg-purple-500/10 text-purple-400'}`}>
+                                        <Zap size={32} />
+                                    </div>
+                                    <div>
+                                        <h3 className="text-xl font-bold text-white flex items-center gap-2">
+                                            {activeAgent.id}
+                                            <span className="text-[10px] bg-white/5 border border-white/10 px-2 py-0.5 rounded-full text-zinc-500 uppercase tracking-widest font-bold">
+                                                {activeAgent.type}
+                                            </span>
+                                        </h3>
+                                        <div className="flex items-center gap-2 mt-1">
+                                            <span className={`w-2 h-2 rounded-full ${activeAgent.status.includes('Finished') ? 'bg-emerald-500' : 'bg-cyan-500 animate-pulse'}`} />
+                                            <span className="text-xs text-zinc-400">{activeAgent.status}</span>
+                                        </div>
+                                    </div>
+                                </div>
+                                <button
+                                    onClick={() => setActiveAgent(null)}
+                                    className="p-2 text-zinc-500 hover:text-white transition-colors bg-white/5 rounded-full"
+                                >
+                                    <X size={20} />
+                                </button>
+                            </div>
+
+                            <div className="flex-1 overflow-y-auto p-6 space-y-6 custom-scrollbar">
+                                <div className="space-y-3">
+                                    <h4 className="text-[10px] font-bold text-zinc-500 uppercase tracking-[0.2em] px-1">Mission Telemetry Stream</h4>
+                                    <div className="bg-black/40 rounded-2xl border border-white/5 font-mono text-[11px] p-4 h-[240px] overflow-y-auto custom-scrollbar leading-relaxed">
+                                        {(storageScanLog || []).filter(l => l.includes(activeAgent.id)).slice(-20).map((log, i) => (
+                                            <div key={i} className="mb-2 py-1 border-b border-white/[0.02] last:border-0 flex gap-3">
+                                                <span className="text-zinc-700 whitespace-nowrap">[{new Date().toLocaleTimeString([], { hour12: false })}]</span>
+                                                <span className="text-zinc-400">{log.split(':').slice(1).join(':').trim()}</span>
+                                            </div>
+                                        ))}
+                                        {!(storageScanLog || []).some(l => l.includes(activeAgent.id)) && (
+                                            <div className="h-full flex flex-col items-center justify-center text-zinc-600 italic">
+                                                <Activity size={24} className="mb-3 opacity-20" />
+                                                <p>Establishing secure channel to agent...</p>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        </motion.div>
+                    </div>
+                )}
+            </AnimatePresence>
+
             <AnimatePresence>
                 {showDeleteModal && (
                     <DeleteConfirmModal
@@ -774,59 +875,205 @@ export default function StorageAnalyzer() {
                 )}
             </AnimatePresence>
 
-            {/* Delete Progress - Centered Modal */}
-            {(storageDeleteProgress || storageDeleteLog.length > 0) && (
-                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
-                    <div className="w-[550px] max-w-[95vw] max-h-[80vh] overflow-hidden">
-                        <DeleteProgress
-                            progress={storageDeleteProgress}
-                            log={storageDeleteLog}
-                        />
-                    </div>
-                </div>
-            )}
+            <DeleteProgress
+                progress={storageDeleteProgress}
+                log={storageDeleteLog}
+            />
 
             {/* Context Menu */}
-            <AnimatePresence>
-                {contextMenu && (
-                    <motion.div
-                        initial={{ opacity: 0, scale: 0.9 }}
-                        animate={{ opacity: 1, scale: 1 }}
-                        exit={{ opacity: 0, scale: 0.9 }}
-                        transition={{ duration: 0.15, ease: [0.4, 0, 0.2, 1] }}
-                        style={{ position: 'fixed', left: contextMenu.x, top: contextMenu.y, zIndex: 100 }}
-                        className="bg-zinc-900/95 backdrop-blur-xl border border-white/[0.1] rounded-xl shadow-2xl overflow-hidden min-w-[220px]"
+            {contextMenu && (
+                <div
+                    className="fixed z-[110] bg-[#1e1e1e]/95 backdrop-blur-xl border border-white/10 rounded-2xl p-1.5 shadow-2xl min-w-[200px]"
+                    style={{ top: contextMenu.y, left: contextMenu.x }}
+                >
+                    <button
+                        onClick={() => {
+                            if (contextMenu.item?.path) toggleStoragePath(contextMenu.item.path);
+                            setContextMenu(null);
+                        }}
+                        className="w-full text-left px-3 py-2 text-xs rounded-lg hover:bg-white/10 flex items-center gap-2"
                     >
-                        <div className="px-3 py-2 border-b border-white/[0.06]">
-                            <div className="text-xs font-medium text-white truncate max-w-[200px]">{contextMenu.item?.name}</div>
-                            <div className="text-[10px] text-zinc-500 font-mono truncate max-w-[200px]">{contextMenu.item?.path}</div>
-                        </div>
-                        <button
-                            onClick={() => { window.ipcRenderer?.invoke('open-in-finder', contextMenu.item.path); setContextMenu(null); }}
-                            className="w-full flex items-center gap-2.5 px-4 py-2 text-sm text-zinc-300 hover:bg-white/[0.06] transition-colors"
+                        Reveal in Finder
+                    </button>
+                    <button
+                        onClick={() => {
+                            clearStorageSelection();
+                            toggleStoragePath(contextMenu.item.path);
+                            setShowDeleteModal(true);
+                            setContextMenu(null);
+                        }}
+                        className="w-full text-left px-3 py-2 text-xs rounded-lg hover:bg-red-500/10 text-red-400 flex items-center gap-2 font-medium"
+                    >
+                        <Trash2 size={14} /> Delete Item
+                    </button>
+                    <div className="h-px bg-white/5 my-1" />
+                    <button
+                        onClick={() => {
+                            interrogateStorageItem(contextMenu.item.path);
+                            setContextMenu(null);
+                        }}
+                        className="w-full text-left px-3 py-2 text-[11px] rounded-lg hover:bg-fuchsia-500/20 text-fuchsia-400 flex items-center gap-2 font-black italic tracking-tight"
+                    >
+                        <Zap size={14} className="animate-pulse" /> ASK AI INTELLIGENCE
+                    </button>
+                </div>
+            )}
+            {/* AI Interrogation Slide-over Panel */}
+            <AnimatePresence>
+                {(storageInterrogating || storageInterrogationResult) && (
+                    <>
+                        <motion.div
+                            initial={{ opacity: 0 }}
+                            animate={{ opacity: 1 }}
+                            exit={{ opacity: 0 }}
+                            onClick={resetInterrogation}
+                            className="fixed inset-0 z-[120] bg-black/60 backdrop-blur-sm"
+                        />
+                        <motion.div
+                            initial={{ x: '100%' }}
+                            animate={{ x: 0 }}
+                            exit={{ x: '100%' }}
+                            transition={{ type: 'spring', damping: 25, stiffness: 200 }}
+                            className="fixed right-0 top-0 bottom-0 w-[450px] z-[130] bg-[#121212] border-l border-white/10 shadow-2xl flex flex-col"
                         >
-                            <FolderOpen size={14} className="text-zinc-500" /> Open in Finder
-                        </button>
-                        <button
-                            onClick={() => { window.ipcRenderer?.invoke('quick-look-file', contextMenu.item.path); setContextMenu(null); }}
-                            className="w-full flex items-center gap-2.5 px-4 py-2 text-sm text-zinc-300 hover:bg-white/[0.06] transition-colors"
-                        >
-                            <Eye size={14} className="text-zinc-500" /> Quick Look
-                        </button>
-                        <button
-                            onClick={() => { navigator.clipboard.writeText(contextMenu.item.path); setContextMenu(null); }}
-                            className="w-full flex items-center gap-2.5 px-4 py-2 text-sm text-zinc-300 hover:bg-white/[0.06] transition-colors"
-                        >
-                            <MoreHorizontal size={14} className="text-zinc-500" /> Copy Path
-                        </button>
-                        <div className="border-t border-white/[0.06]" />
-                        <button
-                            onClick={() => { toggleStoragePath(contextMenu.item.path); setShowDeleteModal(true); setContextMenu(null); }}
-                            className="w-full flex items-center gap-2.5 px-4 py-2 text-sm text-red-400 hover:bg-red-500/10 transition-colors"
-                        >
-                            <Trash2 size={14} /> Move to Trash
-                        </button>
-                    </motion.div>
+                            <div className="p-6 border-b border-white/5 flex items-center justify-between bg-white/[0.02]">
+                                <div className="flex items-center gap-3">
+                                    <div className="w-10 h-10 rounded-xl bg-fuchsia-500/10 flex items-center justify-center border border-fuchsia-500/20">
+                                        <Zap size={20} className="text-fuchsia-400" />
+                                    </div>
+                                    <div>
+                                        <h3 className="text-lg font-bold text-white leading-tight">AI Agent Report</h3>
+                                        <p className="text-[10px] text-zinc-500 uppercase tracking-widest font-bold">Deep File Interrogation</p>
+                                    </div>
+                                </div>
+                                <button onClick={resetInterrogation} className="p-2 hover:bg-white/5 rounded-full text-zinc-500 hover:text-white transition-colors">
+                                    <X size={20} />
+                                </button>
+                            </div>
+
+                            <div className="flex-1 overflow-y-auto p-8 space-y-8 custom-scrollbar">
+                                {storageInterrogating ? (
+                                    <div className="h-full flex flex-col items-center justify-center space-y-6">
+                                        <div className="relative">
+                                            <div className="w-16 h-16 rounded-full border-t-2 border-fuchsia-500 animate-spin" />
+                                            <Zap size={24} className="absolute inset-0 m-auto text-fuchsia-400 animate-pulse" />
+                                        </div>
+                                        <div className="text-center">
+                                            <p className="text-sm font-bold text-white italic">Scanning bitstreams...</p>
+                                            <p className="text-xs text-zinc-500 mt-1">Interrogating OS metadata and project patterns.</p>
+                                        </div>
+                                    </div>
+                                ) : storageInterrogationResult?.status === 'error' ? (
+                                    <div className="p-6 rounded-3xl bg-red-500/5 border border-red-500/10 text-center">
+                                        <AlertTriangle size={32} className="mx-auto text-red-500 mb-4" />
+                                        <h4 className="text-white font-bold mb-2">Analysis Failed</h4>
+                                        <p className="text-xs text-zinc-500">{storageInterrogationResult.message}</p>
+                                    </div>
+                                ) : (
+                                    <motion.div
+                                        initial={{ opacity: 0, y: 10 }}
+                                        animate={{ opacity: 1, y: 0 }}
+                                        className="space-y-8"
+                                    >
+                                        {/* Header Info */}
+                                        <div className="space-y-4">
+                                            <div className="flex items-start gap-4">
+                                                <div className="p-3 rounded-2xl bg-white/5 border border-white/10">
+                                                    {storageInterrogationResult.is_directory ? <FolderOpen size={24} className="text-blue-400" /> : <FileText size={24} className="text-zinc-400" />}
+                                                </div>
+                                                <div className="flex-1 min-w-0">
+                                                    <h4 className="text-xl font-black text-white truncate" title={storageInterrogationResult.name}>
+                                                        {storageInterrogationResult.name}
+                                                    </h4>
+                                                    <p className="text-xs text-zinc-500 truncate mt-1">{storageInterrogationResult.path}</p>
+                                                </div>
+                                            </div>
+
+                                            <div className="grid grid-cols-2 gap-3">
+                                                <div className="bg-white/5 rounded-2xl p-4 border border-white/5">
+                                                    <div className="text-[10px] text-zinc-500 uppercase font-black mb-1">Total Size</div>
+                                                    <div className="text-lg font-black text-white">{storageInterrogationResult.total_size_formatted || storageInterrogationResult.size_formatted}</div>
+                                                </div>
+                                                <div className="bg-white/5 rounded-2xl p-4 border border-white/5">
+                                                    <div className="text-[10px] text-zinc-500 uppercase font-black mb-1">Entity Type</div>
+                                                    <div className="text-lg font-black text-white">{storageInterrogationResult.project_type || (storageInterrogationResult.is_directory ? 'Folder' : 'File')}</div>
+                                                </div>
+                                            </div>
+                                        </div>
+
+                                        {/* Status / Risk */}
+                                        <div className={`p-5 rounded-3xl border ${storageInterrogationResult.risk?.includes('safe') ? 'bg-emerald-500/5 border-emerald-500/10' : 'bg-amber-500/5 border-amber-500/10'}`}>
+                                            <div className="flex items-center gap-3 mb-2">
+                                                <Info size={16} className={storageInterrogationResult.risk?.includes('safe') ? 'text-emerald-400' : 'text-amber-400'} />
+                                                <span className="text-xs font-bold uppercase tracking-wider text-zinc-300">Agent Recommendation</span>
+                                            </div>
+                                            <p className="text-sm text-white/90 leading-relaxed font-medium capitalize">
+                                                {storageInterrogationResult.risk || "Standard resource. No immediate risk detected."}
+                                            </p>
+                                        </div>
+
+                                        {/* Deep Insights */}
+                                        {storageInterrogationResult.is_directory ? (
+                                            <div className="space-y-4">
+                                                <h5 className="text-[10px] font-black text-zinc-600 uppercase tracking-widest px-1">Top Components</h5>
+                                                <div className="space-y-2">
+                                                    {storageInterrogationResult.top_items?.map((item, i) => (
+                                                        <div key={i} className="bg-white/[0.02] border border-white/5 rounded-2xl p-4 flex items-center justify-between">
+                                                            <div className="flex items-center gap-3 min-w-0">
+                                                                <div className="w-1.5 h-1.5 rounded-full bg-zinc-700" />
+                                                                <span className="text-xs text-zinc-300 truncate font-medium">{item.name}</span>
+                                                            </div>
+                                                            <span className="text-[11px] font-mono text-zinc-500 bg-white/5 px-2 py-0.5 rounded-md">{item.size_formatted}</span>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        ) : (
+                                            <div className="space-y-4">
+                                                <h5 className="text-[10px] font-black text-zinc-600 uppercase tracking-widest px-1">File Metadata</h5>
+                                                <div className="grid grid-cols-1 gap-2">
+                                                    {[
+                                                        { label: 'MIME Type', value: storageInterrogationResult.mime_type },
+                                                        { label: 'Created', value: storageInterrogationResult.created },
+                                                        { label: 'Modified', value: storageInterrogationResult.modified },
+                                                        { label: 'Last Accessed', value: storageInterrogationResult.accessed }
+                                                    ].map((attr, i) => (
+                                                        <div key={i} className="flex justify-between items-center bg-white/[0.02] p-3 rounded-xl border border-white/5 text-xs">
+                                                            <span className="text-zinc-500">{attr.label}</span>
+                                                            <span className="text-zinc-300 font-mono tracking-tighter">{attr.value}</span>
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {/* Project Markers */}
+                                        {storageInterrogationResult.markers?.length > 0 && (
+                                            <div className="space-y-3">
+                                                <h5 className="text-[10px] font-black text-zinc-600 uppercase tracking-widest px-1">Structure Markers</h5>
+                                                <div className="flex flex-wrap gap-2">
+                                                    {storageInterrogationResult.markers.map((m, i) => (
+                                                        <span key={i} className="bg-blue-500/10 border border-blue-500/20 text-blue-400 text-[10px] font-bold px-3 py-1 rounded-full">
+                                                            {m}
+                                                        </span>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        )}
+                                    </motion.div>
+                                )}
+                            </div>
+
+                            <div className="p-8 border-t border-white/5">
+                                <button
+                                    onClick={resetInterrogation}
+                                    className="w-full py-4 rounded-2xl bg-white text-black text-sm font-black hover:bg-zinc-200 transition-colors shadow-xl"
+                                >
+                                    Done Analysis
+                                </button>
+                            </div>
+                        </motion.div>
+                    </>
                 )}
             </AnimatePresence>
         </div>

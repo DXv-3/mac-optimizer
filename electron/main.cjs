@@ -6,6 +6,7 @@ const path = require('node:path');
 const os = require('node:os');
 const { exec } = require('node:child_process');
 const util = require('node:util');
+const agentManager = require('./agent-manager.cjs');
 
 const execAsync = util.promisify(exec);
 
@@ -28,8 +29,11 @@ function createWindow() {
         height: 700,
         minWidth: 800,
         minHeight: 600,
-        // Standard frame for stability, styled with vibrancy in CSS
-        frame: true,
+        frame: false, // frameless allows custom CSS + Vibrancy to shine
+        titleBarStyle: 'hiddenInset',
+        vibrancy: 'under-window',
+        visualEffectState: 'followWindow',
+        transparent: true,
         webPreferences: {
             preload: path.join(__dirname, 'preload.cjs'),
             sandbox: false,
@@ -166,199 +170,215 @@ ipcMain.handle('execute-cleanup', async (event, targetPaths) => {
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// PILLAR 5: Storage Scanner with IPC Batching
-// ═══════════════════════════════════════════════════════════════════════════════// ─── Storage Analyzer: Snapshot-based Streaming IPC ──────────────────────────
+// PILLAR 5: Rust Core Storage Scanner with 60fps IPC Batching
+// ═══════════════════════════════════════════════════════════════════════════════
 //
 // Architecture:
-//   Python scanner → line-delimited JSON on stdout
-//   main.cjs readline → internal snapshot buffer (150ms tick)
-//   snapshot tick → ONE 'storage-scan-event' per tick to renderer
-//
-// Each emitted snapshot carries a scanId so the renderer can discard
-// stale events from a previous (cancelled) scan.
+//   mac-optimizer-core (Rust) → NDJSON on stdout
+//   main.cjs readline → buffer array
+//   setTimeout(16ms) → flush buffer to renderer via 'scan:batch' (60fps)
 
-let _scanProcess = null;
-let _scanId = null;
-let _snapInterval = null;
+let _rustScanProcess = null;
+let _scanBuffer = [];
+let _flushTimer = null;
+let _scanInProgress = false;
 
-// Snapshot accumulator — reset at scan start, flushed every 150ms
-const _snap = {
-    progress: null,
-    addedItems: [],       // items accumulated since last flush
-    totalItems: 0,
-    totalBytes: 0,
-    warnings: [],
-    agentStatusUpdates: [],
-    newInsights: [],
-    complete: null,
-    error: null,
-};
-
-function _resetSnap() {
-    _snap.progress = null;
-    _snap.addedItems = [];
-    _snap.totalItems = 0;
-    _snap.totalBytes = 0;
-    _snap.warnings = [];
-    _snap.agentStatusUpdates = [];
-    _snap.newInsights = [];
-    _snap.complete = null;
-    _snap.error = null;
-}
-
-function _flushSnapshot(status) {
+function _flushRustBuffer(status = null, error = null) {
     if (!win || win.isDestroyed()) return;
 
-    const snapshot = {
-        type: 'snapshot',
-        scanId: _scanId,
-        ts: Date.now(),
-        status: status || 'scanning',
-        totals: {
-            itemsFound: _snap.totalItems,
-            bytesFound: Math.min(_snap.totalBytes, Number.MAX_SAFE_INTEGER),
-        },
+    // Transform Rust FsItem format to frontend-expected format
+    const items = _scanBuffer.splice(0).map(item => ({
+        id: item.path,
+        name: item.path.split('/').pop() || item.path,
+        path: item.path,
+        size: item.size,
+        sizeBytes: item.size,
+        sizeFormatted: formatBytes(item.size),
+        isDirectory: item.is_dir,
+        modifiedTime: item.modified_time,
+        permissions: item.permissions,
+        isClone: item.is_clone,
+        physicalSize: item.physical_size,
+    }));
+
+    const payload = {
+        type: 'batch',
+        items: items
     };
 
-    if (_snap.progress) snapshot.progress = _snap.progress;
-    if (_snap.addedItems.length > 0) {
-        snapshot.addedItems = _snap.addedItems.splice(0); // drain
-    }
-    if (_snap.warnings.length > 0) {
-        snapshot.warnings = _snap.warnings.splice(0);
-    }
-    if (_snap.agentStatusUpdates.length > 0) {
-        snapshot.agentStatusUpdates = _snap.agentStatusUpdates.splice(0);
-    }
-    if (_snap.newInsights.length > 0) {
-        snapshot.newInsights = _snap.newInsights.splice(0);
-    }
-    if (_snap.complete) {
-        snapshot.complete = _snap.complete;
-        // Merge disk totals into top-level totals
-        snapshot.totals.disk_total = _snap.complete.disk_total || 0;
-        snapshot.totals.disk_used = _snap.complete.disk_used || 0;
-        snapshot.totals.disk_free = _snap.complete.disk_free || 0;
-    }
-    if (_snap.error) snapshot.error = _snap.error;
+    if (status) payload.status = status;
+    if (error) payload.error = error;
 
-    win.webContents.send('storage-scan-event', snapshot);
+    if (payload.items.length > 0 || status || error) {
+        win.webContents.send('storage-scan-event', payload);
+    }
 }
 
-function _stopScan(reason) {
-    if (_snapInterval) { clearInterval(_snapInterval); _snapInterval = null; }
-    if (_scanProcess) { try { _scanProcess.kill(); } catch (_) { } _scanProcess = null; }
-
-    if (reason === 'cancelled' || reason === 'error' || reason === 'done') {
-        _flushSnapshot(reason);
-    }
-    _scanId = null;
-    _resetSnap();
+// Helper to format bytes consistently
+function formatBytes(bytes) {
+    if (!bytes || bytes === 0) return '0 B';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
+    return `${(bytes / Math.pow(1024, i)).toFixed(i > 0 ? 2 : 0)} ${units[i]}`;
 }
 
-ipcMain.on('start-storage-scan', (event) => {
-    // Kill any existing scan first
-    _stopScan(null); // silent stop, no flush
+function _scheduleFlush() {
+    if (!_scanInProgress) return;
 
-    // Fresh scanId — renderer ignores events from old scanId
-    _scanId = `scan-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-    _resetSnap();
+    _flushRustBuffer();
 
-    const scriptPath = path.join(process.env.APP_ROOT, 'agents', 'swarm_scanner.py');
-    const child = spawn('python3', [scriptPath, 'scan'], {
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...process.env, PYTHONUNBUFFERED: '1' },
+    // 16ms target = ~60fps
+    _flushTimer = setTimeout(_scheduleFlush, 16);
+}
+
+function _stopRustScan() {
+    _scanInProgress = false;
+    if (_flushTimer) { clearTimeout(_flushTimer); _flushTimer = null; }
+    if (_rustScanProcess) { try { _rustScanProcess.kill(); } catch (_) { } _rustScanProcess = null; }
+    _scanBuffer = [];
+}
+
+ipcMain.on('start-storage-scan', (event, scanPath) => {
+    // 1. Kill any existing scan
+    _stopRustScan();
+
+    // 2. Resolve paths
+    const targetPath = scanPath || '/'; // Default to root if none provided
+    const binPath = path.join(process.env.APP_ROOT, 'bin', 'mac-optimizer-core');
+
+    if (!fs.existsSync(binPath)) {
+        win.webContents.send('scan:batch', { status: 'error', error: 'Rust core binary not found. Please build Phase 1.' });
+        return;
+    }
+
+    _scanInProgress = true;
+    _flushRustBuffer('scanning'); // Initial state
+
+    // 3. Spawn the Rust binary
+    _rustScanProcess = spawn(binPath, ['scan', targetPath], {
+        stdio: ['ignore', 'pipe', 'pipe']
     });
 
-    _scanProcess = child;
+    // 4. Start the 60fps flush loop
+    _scheduleFlush();
 
-    // Send initial snapshot so renderer shows scanning state immediately
-    _flushSnapshot('scanning');
+    // 5. Read stdout
+    const rl = readline.createInterface({ input: _rustScanProcess.stdout, crlfDelay: Infinity });
 
-    // 150ms snapshot tick — renderer receives ≤7 updates/sec
-    _snapInterval = setInterval(() => _flushSnapshot('scanning'), 150);
-
-    // Parse line-delimited JSON from Python
-    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
     rl.on('line', (line) => {
         if (!line) return;
-        let data;
-        try { data = JSON.parse(line); } catch (_) { return; } // skip malformed
-
-        const evt = data.event || data.type;
-
-        if (evt === 'batch') {
-            // Python-side item batch — accumulate all items
-            const items = Array.isArray(data.items) ? data.items : [];
-            for (const item of items) {
-                _snap.addedItems.push(item);
-                _snap.totalItems++;
-                _snap.totalBytes += (item.sizeBytes || item.size || 0);
-            }
-        } else if (evt === 'item') {
-            // Single item (fallback if Python sends unbatched)
-            _snap.addedItems.push(data);
-            _snap.totalItems++;
-            _snap.totalBytes += (data.sizeBytes || data.size || 0);
-        } else if (evt === 'progress') {
-            _snap.progress = {
-                phase: data.phase || data.dir || '',
-                dir: data.dir || data.current_path || '',
-                files: data.files || data.files_processed || 0,
-                bytes: data.bytes || data.bytes_scanned || 0,
-                rate_mbps: data.rate_mbps || data.scan_rate_mbps || 0,
-                eta_seconds: data.eta_seconds ?? -1,
-                elapsed: data.elapsed || 0,
-            };
-        } else if (evt === 'warning') {
-            _snap.warnings.push(data.message || String(data));
-        } else if (evt === 'agent_status') {
-            _snap.agentStatusUpdates.push({
-                agent_id: data.agent_id,
-                status: data.status,
-                type: data.type
-            });
-        } else if (evt === 'insight') {
-            _snap.newInsights.push(data);
-        } else if (evt === 'complete') {
-            _snap.complete = data;
-            // Patch disk totals into snapshot totals on final flush
-            _snap.totalItems = (data.items || []).length || _snap.totalItems;
-            _snap.totalBytes = data.disk_used || _snap.totalBytes;
-        } else if (evt === 'error') {
-            _snap.error = { message: data.message || 'Unknown error' };
+        try {
+            const item = JSON.parse(line);
+            _scanBuffer.push(item);
+        } catch (_) {
+            // Ignore parse errors from non-NDJSON lines
         }
     });
 
-    child.stderr.on('data', (chunk) => {
-        const msg = chunk.toString();
-        if (msg.includes('Error') || msg.includes('Traceback')) {
-            console.error('[storage_scanner stderr]', msg.slice(0, 400));
-        }
+    _rustScanProcess.stderr.on('data', (chunk) => {
+        console.warn('[Rust Scanner stderr]:', chunk.toString().trim());
     });
 
-    child.on('close', (code) => {
-        _scanProcess = null;
-        if (_snapInterval) { clearInterval(_snapInterval); _snapInterval = null; }
-        if (code !== 0 && !_snap.complete) {
-            _snap.error = { message: `Scanner exited with code ${code}` };
-            _flushSnapshot('error');
-        } else {
-            _flushSnapshot('done');
-        }
-        _scanId = null;
-        _resetSnap();
+    _rustScanProcess.on('close', (code) => {
+        _scanInProgress = false;
+        if (_flushTimer) { clearTimeout(_flushTimer); _flushTimer = null; }
+
+        // Final flush
+        _flushRustBuffer(code === 0 ? 'complete' : 'error');
+        _rustScanProcess = null;
     });
 
-    child.on('error', (err) => {
-        _scanProcess = null;
-        _snap.error = { message: err.message };
-        _stopScan('error');
+    _rustScanProcess.on('error', (err) => {
+        _scanInProgress = false;
+        if (_flushTimer) { clearTimeout(_flushTimer); _flushTimer = null; }
+
+        _flushRustBuffer('error', err.message);
+        _rustScanProcess = null;
     });
 });
 
 ipcMain.on('cancel-storage-scan', () => {
-    _stopScan('cancelled');
+    _stopRustScan();
+    _flushRustBuffer('cancelled');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Performance Optimization: Resource Monitor & System Tweaks
+// ═══════════════════════════════════════════════════════════════════════════════
+
+ipcMain.on('start-resource-monitor', (event) => {
+    const scriptPath = path.join(process.env.APP_ROOT, 'agents', 'resource_monitor.py');
+    const child = agentManager.spawnAgent('resource_monitor', scriptPath, [], {
+        env: { ...process.env, PYTHONUNBUFFERED: '1' }
+    });
+
+    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+    rl.on('line', (line) => {
+        if (!line) return;
+        try {
+            const data = JSON.parse(line);
+            if (data.event === 'resource_tick') {
+                event.sender.send('resource-monitor-tick', data);
+            }
+        } catch (_) { }
+    });
+});
+
+ipcMain.on('stop-resource-monitor', () => {
+    agentManager.killAgent('resource_monitor');
+});
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Anomaly Hunter AI
+// ═══════════════════════════════════════════════════════════════════════════════
+
+ipcMain.on('start-anomaly-hunter', (event) => {
+    const scriptPath = path.join(process.env.APP_ROOT, 'agents', 'anomaly_hunter.py');
+    const child = agentManager.spawnAgent('anomaly_hunter', scriptPath, [], {
+        env: { ...process.env, PYTHONUNBUFFERED: '1' }
+    });
+
+    const rl = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+    rl.on('line', (line) => {
+        if (!line) return;
+        try {
+            const data = JSON.parse(line);
+            if (data.event === 'anomaly_insights' && data.insights.length > 0) {
+                event.sender.send('anomaly-hunter-insights', data.insights);
+            }
+        } catch (_) { }
+    });
+});
+
+ipcMain.on('stop-anomaly-hunter', () => {
+    agentManager.killAgent('anomaly_hunter');
+});
+
+ipcMain.handle('invoke-system-optimizer', async (event, commandName, args = {}) => {
+    return new Promise((resolve) => {
+        const scriptPath = path.join(process.env.APP_ROOT, 'agents', 'system_optimizer.py');
+        const child = spawn('python3', [scriptPath], {
+            stdio: ['pipe', 'pipe', 'pipe'],
+            env: { ...process.env, PYTHONUNBUFFERED: '1' },
+        });
+
+        let outputData = '';
+
+        child.stdout.on('data', (data) => { outputData += data.toString(); });
+
+        child.on('close', () => {
+            try {
+                const result = JSON.parse(outputData.trim());
+                resolve(result);
+            } catch (err) {
+                resolve({ status: 'error', message: 'Failed to parse optimizer output' });
+            }
+        });
+
+        // Send command to stdin
+        child.stdin.write(JSON.stringify({ action: commandName, ...args }) + '\n');
+        child.stdin.end();
+    });
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -382,6 +402,25 @@ ipcMain.handle('execute-storage-delete', async (event, paths) => {
     }
 
     return { status: 'success', ...results };
+});
+
+ipcMain.handle('interrogate-storage-item', async (event, filePath) => {
+    try {
+        const scriptPath = path.join(process.env.APP_ROOT, 'agents', 'file_interrogator.py');
+        const { exec } = require('child_process');
+        const util = require('util');
+        const execAsync = util.promisify(exec);
+
+        const { stdout } = await execAsync(`python3 "${scriptPath}" "${filePath}"`, {
+            timeout: 10000,
+            maxBuffer: 1024 * 1024
+        });
+
+        return JSON.parse(stdout);
+    } catch (err) {
+        console.error('Interrogation Error:', err);
+        return { status: 'error', message: err.message };
+    }
 });
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -442,20 +481,25 @@ const FDA_PROBE_PATHS = [
 ];
 
 function checkFdaGranted() {
+    console.log('[FDA Check] Starting FDA detection...');
     for (const probePath of FDA_PROBE_PATHS) {
         // Check if the path exists first (stat with no read attempt)
         try {
             fs.statSync(probePath);
+            console.log(`[FDA Check] Probe path exists: ${probePath}`);
         } catch (statErr) {
             // Path doesn't exist — try next fallback
+            console.log(`[FDA Check] Probe path does not exist: ${probePath}`);
             continue;
         }
         // Path exists — now check if we can read it
         try {
             fs.accessSync(probePath, fs.constants.R_OK);
             // Success: FDA is granted
+            console.log(`[FDA Check] ✅ FDA GRANTED - Can read: ${probePath}`);
             return { granted: true, probePath, confidence: 'high' };
         } catch (accessErr) {
+            console.log(`[FDA Check] ❌ FDA DENIED - Cannot read: ${probePath} (${accessErr.code})`);
             if (accessErr.code === 'EACCES' || accessErr.code === 'EPERM') {
                 // Definitive permission denial
                 return { granted: false, probePath, confidence: 'high' };
@@ -464,6 +508,7 @@ function checkFdaGranted() {
         }
     }
     // No probe path found on this Mac — assume granted (don't block the user)
+    console.log('[FDA Check] ⚠️ No probe paths found, assuming granted (low confidence)');
     return { granted: true, probePath: null, confidence: 'low' };
 }
 
@@ -483,8 +528,22 @@ const FDA_SETTINGS_URL = 'x-apple.systempreferences:com.apple.preference.securit
 
 ipcMain.handle('open-fda-settings', async () => {
     try {
-        await shell.openExternal(FDA_SETTINGS_URL);
-        return { status: 'success' };
+        // Show native dialog explaining why we need FDA
+        const { response } = await dialog.showMessageBox(win, {
+            type: 'info',
+            buttons: ['Open System Settings', 'Cancel'],
+            defaultId: 0,
+            cancelId: 1,
+            title: 'Full Disk Access Required',
+            message: 'Mac Optimizer needs Full Disk Access to scan system files, caches, and logs.',
+            detail: '1. Click "Open System Settings"\n2. Click the lock to make changes\n3. Check "Mac Optimizer" in the list\n4. Return to this app',
+        });
+        
+        if (response === 0) {
+            await shell.openExternal(FDA_SETTINGS_URL);
+            return { status: 'success' };
+        }
+        return { status: 'cancelled' };
     } catch (err) {
         // Fallback: open the top-level Privacy & Security pane
         try {
@@ -493,6 +552,36 @@ ipcMain.handle('open-fda-settings', async () => {
         } catch (fallbackErr) {
             return { status: 'error', message: fallbackErr.message };
         }
+    }
+});
+
+// Native permission request (macOS 10.14+)
+// This triggers the system prompt for FDA if the app is properly signed
+ipcMain.handle('request-fda-native', async () => {
+    try {
+        // For signed apps, accessing a TCC-protected path triggers the system prompt
+        // We'll try to access a harmless file that requires FDA
+        const testPaths = [
+            path.join(os.homedir(), 'Library', 'Safari', 'History.db'),
+            path.join(os.homedir(), 'Library', 'Messages', 'chat.db'),
+        ];
+        
+        for (const testPath of testPaths) {
+            try {
+                fs.accessSync(testPath, fs.constants.R_OK);
+                return { granted: true, path: testPath };
+            } catch (err) {
+                if (err.code === 'EACCES' || err.code === 'EPERM') {
+                    // Permission denied - FDA not granted
+                    return { granted: false, path: testPath, error: err.code };
+                }
+                // Path doesn't exist, try next
+            }
+        }
+        
+        return { granted: false, error: 'No test paths available' };
+    } catch (err) {
+        return { granted: false, error: err.message };
     }
 });
 
