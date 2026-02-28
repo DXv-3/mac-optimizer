@@ -457,7 +457,7 @@ const useStore = create((set, get) => ({
                     const prev = get().storageWarnings;
                     update.storageWarnings = [...prev, ...warnings].slice(-100);
                 }
-                
+
                 // Handle scan log entries
                 if (snapshot.log && snapshot.log.length > 0) {
                     const prevLog = get().storageScanLog || [];
@@ -544,13 +544,13 @@ const useStore = create((set, get) => ({
             // ── Batch format from main.cjs ────────────────────────────────
             if (snapshot.type === 'batch') {
                 const update = {};
-                
+
                 // Handle items
                 if (Array.isArray(snapshot.items) && snapshot.items.length > 0) {
                     const prevItems = get().storageItems || [];
                     update.storageItems = [...prevItems, ...snapshot.items];
                 }
-                
+
                 // Handle status updates
                 if (snapshot.status) {
                     if (snapshot.status === 'scanning') {
@@ -564,7 +564,7 @@ const useStore = create((set, get) => ({
                         update.storageScanProgress = null;
                     }
                 }
-                
+
                 if (Object.keys(update).length > 0) {
                     set(update);
                 }
@@ -577,14 +577,38 @@ const useStore = create((set, get) => ({
 
             switch (eventType) {
                 case 'progress':
-                    set({
+                    set((state) => ({
                         storageScanProgress: {
-                            phase: snapshot.phase, currentPath: snapshot.current_path,
-                            filesProcessed: snapshot.files_processed, bytesScanned: snapshot.bytes_scanned,
-                            scanRateMbps: snapshot.scan_rate_mbps, etaSeconds: snapshot.eta_seconds,
+                            ...state.storageScanProgress,
+                            phase: snapshot.phase || 'Scanning',
+                            currentPath: snapshot.current_path,
+                            filesProcessed: snapshot.files_processed,
+                            bytesScanned: snapshot.bytes_scanned,
                             elapsed: snapshot.elapsed || 0,
                         }
-                    });
+                    }));
+                    break;
+                case 'agent_status':
+                    set((state) => ({
+                        storageSwarmStatus: {
+                            ...state.storageSwarmStatus,
+                            [snapshot.agent_id]: snapshot
+                        }
+                    }));
+                    break;
+                case 'swarm_phase':
+                    set((state) => ({
+                        storageScanProgress: {
+                            ...state.storageScanProgress,
+                            phase: snapshot.phase,
+                            message: snapshot.message
+                        }
+                    }));
+                    break;
+                case 'insight':
+                    set((state) => ({
+                        storageSwarmInsights: [...(state.storageSwarmInsights || []), snapshot]
+                    }));
                     break;
                 case 'item':
                     set({ storageItems: [...state.storageItems, snapshot] });

@@ -330,15 +330,16 @@ ipcMain.on('start-storage-scan', (event, scanPath) => {
                 } else if (parsed.path) { // Single item
                     _scanBuffer.push(parsed);
                 }
-            } else if (parsed.event === 'progress' || parsed.event === 'swarm_phase' || parsed.event === 'agent_status') {
+            } else if (parsed.event === 'progress' || parsed.event === 'swarm_phase' || parsed.event === 'agent_status' || parsed.event === 'insight') {
                 // Instantly proxy progress/status events to the UI thread (bypassing the flush loop)
-                win.webContents.send('storage-scan-progress', parsed);
+                win.webContents.send('storage-scan-event', parsed);
             } else if (parsed.event === 'complete') {
                 // Push the final items and wait for the loop to complete natively
                 if (parsed.items) {
                     _scanBuffer.push(...parsed.items);
                 }
-                win.webContents.send('storage-scan-complete', parsed.metrics);
+                parsed.type = 'snapshot'; // Help frontend read totals
+                // win.webContents.send('storage-scan-event', parsed); // Not needed, on('close') handles completion
             }
 
             if (_scanBuffer.length > 0 && _scanBuffer.length % 100 === 0) {
