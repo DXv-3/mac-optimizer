@@ -275,22 +275,26 @@ ipcMain.on('start-storage-scan', (event, scanPath) => {
 
     // 2. Resolve paths
     const targetPath = scanPath || os.homedir(); // Default to home folder for reasonable scan times
-    const binPath = path.join(process.env.APP_ROOT, 'bin', 'mac-optimizer-core');
-    console.log('[Main] Target path:', targetPath);
-    console.log('[Main] Binary path:', binPath);
-    console.log('[Main] Binary exists:', fs.existsSync(binPath));
+    const pythonScriptPath = path.join(process.env.APP_ROOT, 'agents', 'swarm_scanner.py');
 
-    if (!fs.existsSync(binPath)) {
-        win.webContents.send('storage-scan-event', { status: 'error', error: 'Rust core binary not found. Please build Phase 1.' });
+    // Check if there is an isolated .venv_builder python, else fallback to system python3
+    const venvPythonPath = path.join(process.env.APP_ROOT, '.venv_builder', 'bin', 'python3');
+    const pythonExe = fs.existsSync(venvPythonPath) ? venvPythonPath : 'python3';
+
+    console.log('[Main] Target path:', targetPath);
+    console.log('[Main] Python execution config:', { pythonExe, pythonScriptPath });
+
+    if (!fs.existsSync(pythonScriptPath)) {
+        win.webContents.send('storage-scan-event', { status: 'error', error: 'Python swarm agent script not found.' });
         return;
     }
 
     _scanInProgress = true;
     _flushRustBuffer('scanning'); // Initial state
 
-    // 3. Spawn the Rust binary
-    console.log('[Main] Spawning Rust binary...');
-    _rustScanProcess = spawn(binPath, ['scan', targetPath], {
+    // 3. Spawn the Python Swarm Scanner
+    console.log('[Main] Spawning Python Swarm Scanner...');
+    _rustScanProcess = spawn(pythonExe, [pythonScriptPath, 'scan', targetPath], {
         stdio: ['ignore', 'pipe', 'pipe']
     });
     console.log('[Main] Rust binary spawned, PID:', _rustScanProcess.pid);
